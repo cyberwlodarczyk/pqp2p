@@ -1,0 +1,16 @@
+{
+  "name": "Open Quantum Safe Dev Container",
+  "image": "docker.io/cyberwlodarczyk/oqs-dev",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-vscode.cpptools"],
+      "settings": {
+        "C_Cpp.default.includePath": [
+          "${containerEnv:OPENSSL_DIR}/include",
+          "${containerEnv:LIBOQS_DIR}/include",
+          "/usr/include"
+        ]
+      }
+    }
+  }
+}
