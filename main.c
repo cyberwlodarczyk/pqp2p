@@ -16,7 +16,7 @@ int main()
         ERR_print_errors_fp(stderr);
         return EXIT_FAILURE;
     }
-    printf("hello, world!\n");
+    printf("hello, group!\n");
     OSSL_PROVIDER_unload(prov);
     OQS_destroy();
     return EXIT_SUCCESS;
