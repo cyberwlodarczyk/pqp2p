@@ -1,140 +1,228 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdbool.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define PORT 1683
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 
-bool start_client(char *addr, int *sock)
+typedef struct
 {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == -1)
+    char *addr;
+    char *cert;
+    char *key;
+    char *ca_cert;
+    int peer_fd;
+    int server_fd;
+    SSL_CTX *ctx;
+    SSL *ssl;
+} peer_t;
+
+bool peer_tcp_accept(peer_t *peer)
+{
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1)
     {
         perror("socket");
         return false;
     }
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = htons(PORT);
-    if (inet_pton(AF_INET, addr, &a.sin_addr) == 0)
+    int opt;
+    if (setsockopt(
+            server_fd,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &opt,
+            sizeof(opt)) == -1)
     {
-        fprintf(stderr, "invalid peer address: %s\n", addr);
-        close(s);
+        perror("setsockopt");
+        close(server_fd);
         return false;
     }
-    if (connect(s, (struct sockaddr *)(&a), sizeof(a)) == -1)
+    struct sockaddr_in server_addr;
+    int server_addr_len = sizeof(server_addr);
+    memset(&server_addr, 0, server_addr_len);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(PORT);
+    if (bind(
+            server_fd,
+            (struct sockaddr *)&server_addr,
+            server_addr_len) == -1)
     {
-        printf("could not connect to %s:%d\n", addr, PORT);
-        close(s);
+        perror("bind");
+        close(server_fd);
         return false;
     }
-    printf("connected to %s:%d\n", addr, PORT);
-    *sock = s;
+    if (listen(server_fd, 1) == -1)
+    {
+        perror("listen");
+        close(server_fd);
+        return false;
+    }
+    printf("listening on 0.0.0.0:%d...\n", PORT);
+    struct sockaddr_in peer_addr;
+    int peer_addr_len = sizeof(peer_addr);
+    int peer_fd = accept(
+        server_fd,
+        (struct sockaddr *)&peer_addr,
+        &peer_addr_len);
+    if (peer_fd == -1)
+    {
+        perror("accept");
+        close(server_fd);
+        return false;
+    }
+    char peer_addr_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &peer_addr.sin_addr, peer_addr_str, INET_ADDRSTRLEN);
+    printf(
+        "connection received from %s:%d\n",
+        peer_addr_str,
+        ntohs(peer_addr.sin_port));
+    peer->peer_fd = peer_fd;
+    peer->server_fd = server_fd;
     return true;
 }
 
-bool run_client(int sock)
+bool peer_tcp_connect(peer_t *peer)
 {
-    char b[BUFFER_SIZE];
+    int peer_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (peer_fd == -1)
+    {
+        perror("socket");
+        return false;
+    }
+    struct sockaddr_in peer_addr;
+    int peer_addr_len = sizeof(peer_addr);
+    memset(&peer_addr, 0, peer_addr_len);
+    peer_addr.sin_family = AF_INET;
+    peer_addr.sin_port = htons(PORT);
+    if (inet_pton(AF_INET, peer->addr, &peer_addr.sin_addr) == 0)
+    {
+        fprintf(stderr, "invalid peer address: %s\n", peer->addr);
+        close(peer_fd);
+        return false;
+    }
+    if (connect(peer_fd, (struct sockaddr *)(&peer_addr), peer_addr_len) == -1)
+    {
+        printf("could not connect to %s:%d\n", peer->addr, PORT);
+        close(peer_fd);
+        return false;
+    }
+    printf("connected to %s:%d\n", peer->addr, PORT);
+    peer->peer_fd = peer_fd;
+    return true;
+}
+
+bool peer_tls_init(peer_t *peer, SSL_METHOD *meth, int mode)
+{
+    SSL_CTX *ctx = SSL_CTX_new(meth);
+    if (ctx == NULL)
+    {
+        return false;
+    }
+    if (SSL_CTX_use_certificate_file(ctx, peer->cert, SSL_FILETYPE_PEM) != 1)
+    {
+        return false;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, peer->key, SSL_FILETYPE_PEM) != 1)
+    {
+        return false;
+    }
+    if (SSL_CTX_check_private_key(ctx) != 1)
+    {
+        return false;
+    }
+    if (SSL_CTX_load_verify_locations(ctx, peer->ca_cert, NULL) != 1)
+    {
+        return false;
+    }
+    SSL_CTX_set_verify(ctx, mode, NULL);
+    SSL *ssl = SSL_new(ctx);
+    if (ssl == NULL)
+    {
+        return false;
+    }
+    if (SSL_set_fd(ssl, peer->peer_fd) != 1)
+    {
+        return false;
+    }
+    peer->ctx = ctx;
+    peer->ssl = ssl;
+    return true;
+}
+
+bool peer_tls_accept(peer_t *peer)
+{
+    if (!peer_tls_init(
+            peer,
+            TLS_server_method(),
+            SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT) ||
+        SSL_accept(peer->ssl) != 1)
+    {
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+    return true;
+}
+
+bool peer_tls_connect(peer_t *peer)
+{
+    if (!peer_tls_init(peer, TLS_client_method(), SSL_VERIFY_PEER) ||
+        SSL_connect(peer->ssl) != 1)
+    {
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+    return true;
+}
+
+bool peer_tls_read(peer_t *peer)
+{
+    char buf[BUFFER_SIZE];
     int n;
     while (true)
     {
-        n = recv(sock, b, BUFFER_SIZE - 1, 0);
+        n = SSL_read(peer->ssl, buf, BUFFER_SIZE - 1);
         if (n <= 0)
         {
-            close(sock);
-            if (n == -1)
+            if (SSL_get_error(peer->ssl, n) != SSL_ERROR_ZERO_RETURN)
             {
-                perror("recv");
+                ERR_print_errors_fp(stderr);
                 return false;
             }
             return true;
         }
-        b[n] = '\0';
-        printf("%s\n", b);
+        buf[n] = '\0';
+        printf("%s\n", buf);
     }
 }
 
-bool start_server(int *sock, int *server_sock)
+bool peer_tls_write(peer_t *peer)
 {
-    int ss = socket(AF_INET, SOCK_STREAM, 0);
-    if (ss == -1)
-    {
-        perror("socket");
-        return false;
-    }
-    int o;
-    if (setsockopt(ss, SOL_SOCKET, SO_REUSEADDR, &o, sizeof(o)) == -1)
-    {
-        perror("setsockopt");
-        return false;
-    }
-    struct sockaddr_in sa;
-    socklen_t sal = sizeof(sa);
-    memset(&sa, 0, sal);
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = INADDR_ANY;
-    sa.sin_port = htons(PORT);
-    if (bind(ss, (struct sockaddr *)&sa, sal) == -1)
-    {
-        perror("bind");
-        close(ss);
-        return false;
-    }
-    if (listen(ss, 1) == -1)
-    {
-        perror("listen");
-        close(ss);
-        return false;
-    }
-    printf("listening on 0.0.0.0:%d...\n", PORT);
-    struct sockaddr_in ca;
-    socklen_t cal = sizeof(ca);
-    int s = accept(ss, (struct sockaddr *)&ca, &cal);
-    if (s == -1)
-    {
-        perror("accept");
-        close(ss);
-        return false;
-    }
-    char cip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &ca.sin_addr, cip, INET_ADDRSTRLEN);
-    printf("connection received from %s:%d\n", cip, ntohs(ca.sin_port));
-    *sock = s;
-    *server_sock = ss;
-    return true;
-}
-
-bool run_server(int sock, int server_sock)
-{
-    char b[BUFFER_SIZE];
+    char buf[BUFFER_SIZE];
     int n;
     while (true)
     {
-        if (scanf("%1023s", b) == EOF)
+        if (fgets(buf, BUFFER_SIZE, stdin) == NULL)
         {
-            close(sock);
-            close(server_sock);
-            if (feof(stdin))
+            if (!feof(stdin))
             {
-                return true;
+                perror("fgets");
+                return false;
             }
-            perror("scanf");
-            return false;
+            return true;
         }
-        n = send(sock, b, strlen(b), 0);
+        n = SSL_write(peer->ssl, buf, strlen(buf));
         if (n <= 0)
         {
-            close(sock);
-            close(server_sock);
-            if (n == -1)
+            if (SSL_get_error(peer->ssl, n) != SSL_ERROR_ZERO_RETURN)
             {
-                perror("send");
+                ERR_print_errors_fp(stderr);
                 return false;
             }
             return true;
@@ -144,27 +232,20 @@ bool run_server(int sock, int server_sock)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2)
+    if (argc != 5)
     {
-        fprintf(stderr, "usage: %s <ip>\n", argv[0]);
+        fprintf(stderr, "usage: %s <addr> <cert> <key> <ca-cert>\n", argv[0]);
         return EXIT_FAILURE;
     }
-    int s;
-    if (!start_client(argv[1], &s))
-    {
-        int ss;
-        if (!start_server(&s, &ss))
-        {
-            return EXIT_FAILURE;
-        }
-        if (!run_server(s, ss))
-        {
-            return EXIT_FAILURE;
-        }
-    }
-    else if (!run_client(s))
-    {
-        return EXIT_FAILURE;
-    }
+    peer_t peer = {
+        .addr = argv[1],
+        .cert = argv[2],
+        .key = argv[3],
+        .ca_cert = argv[4],
+        .peer_fd = -1,
+        .server_fd = -1,
+        .ctx = NULL,
+        .ssl = NULL,
+    };
     return EXIT_SUCCESS;
 }
