@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/provider.h>
 
 #define PORT 1683
 #define BUFFER_SIZE 4096
@@ -237,7 +238,7 @@ bool peer_read(peer_t *peer)
             return true;
         }
         buf[n] = '\0';
-        printf("%s\n", buf);
+        printf("%s", buf);
     }
 }
 
@@ -257,7 +258,7 @@ bool peer_write(peer_t *peer)
             return true;
         }
         buf_len = strlen(buf);
-        if (buf_len == 4 && strncmp(buf, "exit", 4) == 0)
+        if (buf_len == 5 && strncmp(buf, "exit\n", 5) == 0)
         {
             return true;
         }
@@ -279,6 +280,37 @@ bool peer_close(peer_t *peer)
     return peer_tls_close(peer) && peer_tcp_close(peer);
 }
 
+bool peer_run(peer_t *peer)
+{
+    if (peer_connect(peer))
+    {
+        if (peer_read(peer))
+        {
+            if (peer_close(peer))
+            {
+                return true;
+            }
+            return false;
+        }
+        peer_close(peer);
+        return false;
+    }
+    if (peer_accept(peer))
+    {
+        if (peer_write(peer))
+        {
+            if (peer_close(peer))
+            {
+                return true;
+            }
+            return false;
+        }
+        peer_close(peer);
+        return false;
+    }
+    return false;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 5)
@@ -296,31 +328,33 @@ int main(int argc, char **argv)
         .ctx = NULL,
         .ssl = NULL,
     };
-    if (peer_connect(&peer))
+    OSSL_PROVIDER *default_prov = OSSL_PROVIDER_load(NULL, "default");
+    if (default_prov == NULL)
     {
-        if (peer_read(&peer))
-        {
-            if (peer_close(&peer))
-            {
-                return EXIT_SUCCESS;
-            }
-            return EXIT_FAILURE;
-        }
-        peer_close(&peer);
+        ERR_print_errors_fp(stderr);
         return EXIT_FAILURE;
     }
-    if (peer_accept(&peer))
+    OSSL_PROVIDER *oqs_prov = OSSL_PROVIDER_load(NULL, "oqsprovider");
+    if (oqs_prov == NULL)
     {
-        if (peer_write(&peer))
-        {
-            if (peer_close(&peer))
-            {
-                return EXIT_SUCCESS;
-            }
-            return EXIT_FAILURE;
-        }
-        peer_close(&peer);
+        ERR_print_errors_fp(stderr);
         return EXIT_FAILURE;
     }
-    return EXIT_FAILURE;
+    if (!peer_run(&peer))
+    {
+        OSSL_PROVIDER_unload(default_prov);
+        OSSL_PROVIDER_unload(oqs_prov);
+        return EXIT_FAILURE;
+    }
+    if (OSSL_PROVIDER_unload(default_prov) == 0)
+    {
+        ERR_print_errors_fp(stderr);
+        return EXIT_FAILURE;
+    }
+    if (OSSL_PROVIDER_unload(oqs_prov) == 0)
+    {
+        ERR_print_errors_fp(stderr);
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
 }
