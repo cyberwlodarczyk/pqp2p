@@ -118,7 +118,18 @@ bool peer_tcp_connect(peer_t *peer)
     return true;
 }
 
-bool peer_tls_init(peer_t *peer, SSL_METHOD *meth, int mode)
+bool peer_tcp_close(peer_t *peer)
+{
+    if ((peer->peer_fd != -1 && close(peer->peer_fd) == -1) ||
+        (peer->server_fd != -1 && close(peer->server_fd) == -1))
+    {
+        perror("close");
+        return false;
+    }
+    return true;
+}
+
+bool peer_tls_init(peer_t *peer, const SSL_METHOD *meth, int mode)
 {
     SSL_CTX *ctx = SSL_CTX_new(meth);
     if (ctx == NULL)
@@ -181,7 +192,35 @@ bool peer_tls_connect(peer_t *peer)
     return true;
 }
 
-bool peer_tls_read(peer_t *peer)
+bool peer_tls_close(peer_t *peer)
+{
+    if (peer->ssl != NULL)
+    {
+        if (SSL_shutdown(peer->ssl) != 1)
+        {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+        SSL_free(peer->ssl);
+    }
+    if (peer->ctx != NULL)
+    {
+        SSL_CTX_free(peer->ctx);
+    }
+    return true;
+}
+
+bool peer_accept(peer_t *peer)
+{
+    return peer_tcp_accept(peer) && peer_tls_accept(peer);
+}
+
+bool peer_connect(peer_t *peer)
+{
+    return peer_tcp_connect(peer) && peer_tls_connect(peer);
+}
+
+bool peer_read(peer_t *peer)
 {
     char buf[BUFFER_SIZE];
     int n;
@@ -202,10 +241,10 @@ bool peer_tls_read(peer_t *peer)
     }
 }
 
-bool peer_tls_write(peer_t *peer)
+bool peer_write(peer_t *peer)
 {
     char buf[BUFFER_SIZE];
-    int n;
+    int buf_len, n;
     while (true)
     {
         if (fgets(buf, BUFFER_SIZE, stdin) == NULL)
@@ -217,7 +256,12 @@ bool peer_tls_write(peer_t *peer)
             }
             return true;
         }
-        n = SSL_write(peer->ssl, buf, strlen(buf));
+        buf_len = strlen(buf);
+        if (buf_len == 4 && strncmp(buf, "exit", 4) == 0)
+        {
+            return true;
+        }
+        n = SSL_write(peer->ssl, buf, buf_len);
         if (n <= 0)
         {
             if (SSL_get_error(peer->ssl, n) != SSL_ERROR_ZERO_RETURN)
@@ -228,6 +272,11 @@ bool peer_tls_write(peer_t *peer)
             return true;
         }
     }
+}
+
+bool peer_close(peer_t *peer)
+{
+    return peer_tls_close(peer) && peer_tcp_close(peer);
 }
 
 int main(int argc, char **argv)
@@ -247,5 +296,31 @@ int main(int argc, char **argv)
         .ctx = NULL,
         .ssl = NULL,
     };
-    return EXIT_SUCCESS;
+    if (peer_connect(&peer))
+    {
+        if (peer_read(&peer))
+        {
+            if (peer_close(&peer))
+            {
+                return EXIT_SUCCESS;
+            }
+            return EXIT_FAILURE;
+        }
+        peer_close(&peer);
+        return EXIT_FAILURE;
+    }
+    if (peer_accept(&peer))
+    {
+        if (peer_write(&peer))
+        {
+            if (peer_close(&peer))
+            {
+                return EXIT_SUCCESS;
+            }
+            return EXIT_FAILURE;
+        }
+        peer_close(&peer);
+        return EXIT_FAILURE;
+    }
+    return EXIT_FAILURE;
 }

@@ -1,6 +1,6 @@
 {
-  "name": "Open Quantum Safe Dev Container",
-  "image": "docker.io/cyberwlodarczyk/oqs-dev",
+  "name": "Post-Quantum P2P Dev Container",
+  "image": "docker.io/cyberwlodarczyk/pqp2p:dev",
   "customizations": {
     "vscode": {
       "extensions": ["ms-vscode.cpptools"],

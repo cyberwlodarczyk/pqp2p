@@ -1,0 +1,62 @@
+openssl_conf       = openssl_init
+config_diagnostics = 1
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+default     = default_sect
+oqsprovider = oqsprovider_sect
+
+[default_sect]
+activate = 1
+
+[oqsprovider_sect]
+activate = 1
+
+[ca]
+default_ca = CA_default
+
+[CA_default]
+dir             = $ENV::HOME
+certs           = $dir/certs
+new_certs_dir   = $dir/newcerts
+serial          = $dir/serial
+database        = $dir/index.txt
+certificate     = $dir/certs/ca-cert.pem
+private_key     = $dir/private/ca-key.pem
+RANDFILE        = $dir/private/.rand
+x509_extensions = usr_cert
+name_opt        = ca_default
+cert_opt        = ca_default
+default_days    = 365
+default_md      = sha256
+preserve        = no
+policy          = policy_strict
+
+[usr_cert]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+
+[policy_strict]
+countryName = match
+commonName  = supplied
+
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions    = v3_ca
+string_mask        = utf8only
+
+[req_distinguished_name]
+countryName         = Country Name (2 letter code)
+countryName_default = PL
+countryName_min     = 2
+countryName_max     = 2
+commonName          = Common Name (e.g. server FQDN or YOUR name)
+commonName_max      = 64
+
+[v3_ca]
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints       = critical,CA:true
