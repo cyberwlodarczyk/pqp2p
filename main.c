@@ -24,7 +24,7 @@ typedef struct
     SSL *ssl;
 } peer_t;
 
-bool peer_tcp_accept(peer_t *peer)
+bool peer_tcp_accept(peer_t *p)
 {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1)
@@ -32,6 +32,7 @@ bool peer_tcp_accept(peer_t *peer)
         perror("socket");
         return false;
     }
+    p->server_fd = server_fd;
     int opt;
     if (setsockopt(
             server_fd,
@@ -78,18 +79,17 @@ bool peer_tcp_accept(peer_t *peer)
         close(server_fd);
         return false;
     }
+    p->peer_fd = peer_fd;
     char peer_addr_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &peer_addr.sin_addr, peer_addr_str, INET_ADDRSTRLEN);
     printf(
         "connection received from %s:%d\n",
         peer_addr_str,
         ntohs(peer_addr.sin_port));
-    peer->peer_fd = peer_fd;
-    peer->server_fd = server_fd;
     return true;
 }
 
-bool peer_tcp_connect(peer_t *peer)
+bool peer_tcp_connect(peer_t *p)
 {
     int peer_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (peer_fd == -1)
@@ -97,32 +97,32 @@ bool peer_tcp_connect(peer_t *peer)
         perror("socket");
         return false;
     }
+    p->peer_fd = peer_fd;
     struct sockaddr_in peer_addr;
     int peer_addr_len = sizeof(peer_addr);
     memset(&peer_addr, 0, peer_addr_len);
     peer_addr.sin_family = AF_INET;
     peer_addr.sin_port = htons(PORT);
-    if (inet_pton(AF_INET, peer->addr, &peer_addr.sin_addr) == 0)
+    if (inet_pton(AF_INET, p->addr, &peer_addr.sin_addr) == 0)
     {
-        fprintf(stderr, "invalid peer address: %s\n", peer->addr);
+        fprintf(stderr, "invalid peer address: %s\n", p->addr);
         close(peer_fd);
         return false;
     }
     if (connect(peer_fd, (struct sockaddr *)(&peer_addr), peer_addr_len) == -1)
     {
-        printf("could not connect to %s:%d\n", peer->addr, PORT);
+        printf("could not connect to %s:%d\n", p->addr, PORT);
         close(peer_fd);
         return false;
     }
-    printf("connected to %s:%d\n", peer->addr, PORT);
-    peer->peer_fd = peer_fd;
+    printf("connected to %s:%d\n", p->addr, PORT);
     return true;
 }
 
-bool peer_tcp_close(peer_t *peer)
+bool peer_tcp_close(peer_t *p)
 {
-    if ((peer->peer_fd != -1 && close(peer->peer_fd) == -1) ||
-        (peer->server_fd != -1 && close(peer->server_fd) == -1))
+    if ((p->peer_fd != -1 && close(p->peer_fd) == -1) ||
+        (p->server_fd != -1 && close(p->server_fd) == -1))
     {
         perror("close");
         return false;
@@ -130,18 +130,20 @@ bool peer_tcp_close(peer_t *peer)
     return true;
 }
 
-bool peer_tls_init(peer_t *peer, const SSL_METHOD *meth, int mode)
+bool peer_tls_init(peer_t *p, const SSL_METHOD *meth, int mode, int (*handshake_fn)(SSL *ssl))
 {
+    printf("initializing tls...\n");
     SSL_CTX *ctx = SSL_CTX_new(meth);
     if (ctx == NULL)
     {
         return false;
     }
-    if (SSL_CTX_use_certificate_file(ctx, peer->cert, SSL_FILETYPE_PEM) != 1)
+    p->ctx = ctx;
+    if (SSL_CTX_use_certificate_file(ctx, p->cert, SSL_FILETYPE_PEM) != 1)
     {
         return false;
     }
-    if (SSL_CTX_use_PrivateKey_file(ctx, peer->key, SSL_FILETYPE_PEM) != 1)
+    if (SSL_CTX_use_PrivateKey_file(ctx, p->key, SSL_FILETYPE_PEM) != 1)
     {
         return false;
     }
@@ -149,7 +151,7 @@ bool peer_tls_init(peer_t *peer, const SSL_METHOD *meth, int mode)
     {
         return false;
     }
-    if (SSL_CTX_load_verify_locations(ctx, peer->ca_cert, NULL) != 1)
+    if (SSL_CTX_load_verify_locations(ctx, p->ca_cert, NULL) != 1)
     {
         return false;
     }
@@ -159,22 +161,27 @@ bool peer_tls_init(peer_t *peer, const SSL_METHOD *meth, int mode)
     {
         return false;
     }
-    if (SSL_set_fd(ssl, peer->peer_fd) != 1)
+    p->ssl = ssl;
+    if (SSL_set_fd(ssl, p->peer_fd) != 1)
     {
         return false;
     }
-    peer->ctx = ctx;
-    peer->ssl = ssl;
+    printf("performing tls handshake...\n");
+    if (handshake_fn(ssl) != 1)
+    {
+        return false;
+    }
+    printf("connection is secure\n");
     return true;
 }
 
-bool peer_tls_accept(peer_t *peer)
+bool peer_tls_accept(peer_t *p)
 {
     if (!peer_tls_init(
-            peer,
+            p,
             TLS_server_method(),
-            SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT) ||
-        SSL_accept(peer->ssl) != 1)
+            SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+            SSL_accept))
     {
         ERR_print_errors_fp(stderr);
         return false;
@@ -182,10 +189,9 @@ bool peer_tls_accept(peer_t *peer)
     return true;
 }
 
-bool peer_tls_connect(peer_t *peer)
+bool peer_tls_connect(peer_t *p)
 {
-    if (!peer_tls_init(peer, TLS_client_method(), SSL_VERIFY_PEER) ||
-        SSL_connect(peer->ssl) != 1)
+    if (!peer_tls_init(p, TLS_client_method(), SSL_VERIFY_PEER, SSL_connect))
     {
         ERR_print_errors_fp(stderr);
         return false;
@@ -193,48 +199,50 @@ bool peer_tls_connect(peer_t *peer)
     return true;
 }
 
-bool peer_tls_close(peer_t *peer)
+bool peer_tls_close(peer_t *p)
 {
-    if (peer->ssl != NULL)
+    if (p->ssl != NULL)
     {
-        if (SSL_shutdown(peer->ssl) != 1)
+        if (SSL_shutdown(p->ssl) != 1)
         {
             ERR_print_errors_fp(stderr);
             return false;
         }
-        SSL_free(peer->ssl);
+        SSL_free(p->ssl);
     }
-    if (peer->ctx != NULL)
+    if (p->ctx != NULL)
     {
-        SSL_CTX_free(peer->ctx);
+        SSL_CTX_free(p->ctx);
     }
     return true;
 }
 
-bool peer_accept(peer_t *peer)
+bool peer_accept(peer_t *p)
 {
-    return peer_tcp_accept(peer) && peer_tls_accept(peer);
+    return peer_tcp_accept(p) && peer_tls_accept(p);
 }
 
-bool peer_connect(peer_t *peer)
+bool peer_connect(peer_t *p)
 {
-    return peer_tcp_connect(peer) && peer_tls_connect(peer);
+    return peer_tcp_connect(p) && peer_tls_connect(p);
 }
 
-bool peer_read(peer_t *peer)
+bool peer_read(peer_t *p)
 {
+    printf("waiting for messages from remote peer...\n");
     char buf[BUFFER_SIZE];
     int n;
     while (true)
     {
-        n = SSL_read(peer->ssl, buf, BUFFER_SIZE - 1);
+        n = SSL_read(p->ssl, buf, BUFFER_SIZE - 1);
         if (n <= 0)
         {
-            if (SSL_get_error(peer->ssl, n) != SSL_ERROR_ZERO_RETURN)
+            if (SSL_get_error(p->ssl, n) != SSL_ERROR_ZERO_RETURN)
             {
                 ERR_print_errors_fp(stderr);
                 return false;
             }
+            printf("connection closed by remote peer\n");
             return true;
         }
         buf[n] = '\0';
@@ -242,8 +250,10 @@ bool peer_read(peer_t *peer)
     }
 }
 
-bool peer_write(peer_t *peer)
+bool peer_write(peer_t *p)
 {
+    printf("reading from stdin...\n");
+    printf("type \"quit\" to exit\n");
     char buf[BUFFER_SIZE];
     int buf_len, n;
     while (true)
@@ -258,14 +268,15 @@ bool peer_write(peer_t *peer)
             return true;
         }
         buf_len = strlen(buf);
-        if (buf_len == 5 && strncmp(buf, "exit\n", 5) == 0)
+        if (buf_len == 5 && strncmp(buf, "quit\n", 5) == 0)
         {
+            printf("exiting...\n");
             return true;
         }
-        n = SSL_write(peer->ssl, buf, buf_len);
+        n = SSL_write(p->ssl, buf, buf_len);
         if (n <= 0)
         {
-            if (SSL_get_error(peer->ssl, n) != SSL_ERROR_ZERO_RETURN)
+            if (SSL_get_error(p->ssl, n) != SSL_ERROR_ZERO_RETURN)
             {
                 ERR_print_errors_fp(stderr);
                 return false;
@@ -275,37 +286,37 @@ bool peer_write(peer_t *peer)
     }
 }
 
-bool peer_close(peer_t *peer)
+bool peer_close(peer_t *p)
 {
-    return peer_tls_close(peer) && peer_tcp_close(peer);
+    return peer_tls_close(p) && peer_tcp_close(p);
 }
 
-bool peer_run(peer_t *peer)
+bool peer_run(peer_t *p)
 {
-    if (peer_connect(peer))
+    if (peer_connect(p))
     {
-        if (peer_read(peer))
+        if (peer_read(p))
         {
-            if (peer_close(peer))
+            if (peer_close(p))
             {
                 return true;
             }
             return false;
         }
-        peer_close(peer);
+        peer_close(p);
         return false;
     }
-    if (peer_accept(peer))
+    if (peer_accept(p))
     {
-        if (peer_write(peer))
+        if (peer_write(p))
         {
-            if (peer_close(peer))
+            if (peer_close(p))
             {
                 return true;
             }
             return false;
         }
-        peer_close(peer);
+        peer_close(p);
         return false;
     }
     return false;
