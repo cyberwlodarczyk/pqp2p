@@ -227,10 +227,50 @@ bool peer_connect(peer_t *p)
     return peer_tcp_connect(p) && peer_tls_connect(p);
 }
 
+bool peer_read_file(peer_t *p)
+{
+    int n;
+    char buf[BUFFER_SIZE]={0};
+    FILE *hash = fopen("received_hash.sha256", "wb");
+    n = SSL_read(p->ssl, buf, 64); // receiving first 64 characters of transmission (which is the hash of the file)
+    fwrite(buf, sizeof(char), n, hash);
+    fclose(hash);
+    FILE *file = fopen("received_file", "wb"); // "wb" for writing file in binary mode (allows for sending all possible data types)
+    while (true) 
+    {
+        n = SSL_read(p->ssl, buf, BUFFER_SIZE); // n is a number of bytes read
+        if (n <= 0)
+        {
+            if (SSL_get_error(p->ssl, n) != SSL_ERROR_ZERO_RETURN)
+            {
+                ERR_print_errors_fp(stderr);
+                return false;
+            }
+            printf("File transfer completed\n");
+            return true;
+        }
+        fwrite(buf, sizeof(char), n, file);
+    }
+    fclose(file);
+    return true;
+}
+
 bool peer_read(peer_t *p)
 {
+    printf("Select whether you expect to receive a file or a text message\n");
+    printf("Type \"file\" to receive a file or \"text\" to receive a text message\n");
+    char mode[BUFFER_SIZE], buf[BUFFER_SIZE]={0};
+    scanf("%s", mode);
+    if (strcmp( mode, "file" ) == 0) // strings are identical
+    {
+        return peer_read_file(p);
+    }
+    else if (strcmp( mode, "text" ) != 0) // given text is neither "file" nor "text"
+    {
+        printf("Invalid inpureadt\n");
+        return false;
+    }
     printf("waiting for messages from remote peer...\n");
-    char buf[BUFFER_SIZE];
     int n;
     while (true)
     {
@@ -250,11 +290,75 @@ bool peer_read(peer_t *p)
     }
 }
 
-bool peer_write(peer_t *p)
+bool peer_send_file(peer_t *p)
 {
+    printf("Enter the path of the file you want to send\n");
+    char file_path[BUFFER_SIZE], buf[BUFFER_SIZE]={0}, output_hash[32]={0}; // 32 is the length of the SHA256 hash
+    scanf("%s", file_path);
+    int n;
+    FILE *file = fopen(file_path, "rb"); // "rb" for reading file in binary mode (allows for sending all possible data types)
+    if (file == NULL) 
+    {
+        perror("Unable to open file\n");
+        return false;
+    }
+    size_t bytesRead;
+    SHA256_CTX sha256_ctx;
+    SHA256_Init(&sha256_ctx);
+    while ((bytesRead = fread(buf, sizeof(char), BUFFER_SIZE, file)) > 0)
+    { 
+        SHA256_Update(&sha256_ctx, buf, bytesRead);
+    }
+    SHA256_Final(output_hash, &sha256_ctx);
+    printf("%s\n", output_hash);
+    printf("Hash in hexadecimal: ");
+    char hash_hex[65]; // razem z null terminator
+    for (int i = 0; i < 32; i++) 
+    { // SHA256 returns 32 bytes which we convert into 64 hexadecimal characters
+        sprintf(&hash_hex[i * 2], "%02x", (unsigned char)output_hash[i]);
+    }
+    printf("%s\n", hash_hex);
+    printf("File hashed successfully\n");
+    n = SSL_write(p->ssl, hash_hex, 64); // we're sending 64 characters of hash
+    printf("File hash sent successfully\n");
+
+    rewind(file); // sets the pointer to the begginning of the file
+    while ((bytesRead = fread(buf, sizeof(char), BUFFER_SIZE, file)) > 0)
+    {  
+        n = SSL_write(p->ssl, buf, bytesRead);
+        if (n <= 0)
+        {
+            if (SSL_get_error(p->ssl, n) != SSL_ERROR_ZERO_RETURN)
+            {
+                ERR_print_errors_fp(stderr);
+                return false;
+            }
+            return true;
+        }
+    }
+    printf("File sent successfully\n");
+    fclose(file);
+    return true;
+}
+
+bool peer_write(peer_t *p)
+{   
+    char mode[BUFFER_SIZE];
+    printf("Choose whether you want to send a file or a text message\n");
+    printf("Type \"file\" to send a file or \"text\" to send a text message\n");
+    scanf("%s", mode);
+    if (strcmp( mode, "file" ) == 0)
+    {
+        return peer_send_file(p);
+    }
+    else if (strcmp( mode, "text" ) != 0)
+    {
+        printf("Invalid inputwrite\n");
+        return false;
+    }
     printf("reading from stdin...\n");
     printf("type \"quit\" to exit\n");
-    char buf[BUFFER_SIZE];
+    char buf[BUFFER_SIZE]={0};
     int buf_len, n;
     while (true)
     {
