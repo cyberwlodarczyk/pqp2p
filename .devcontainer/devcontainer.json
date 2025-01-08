@@ -3,7 +3,9 @@
   "image": "docker.io/cyberwlodarczyk/pqp2p:dev",
   "customizations": {
     "vscode": {
-      "extensions": ["ms-vscode.cpptools"],
+      "extensions": [
+        "ms-vscode.cpptools"
+      ],
       "settings": {
         "C_Cpp.default.includePath": [
           "${containerEnv:OPENSSL_DIR}/include",

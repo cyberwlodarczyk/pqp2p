@@ -1,16 +1,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <openssl/ssl.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/evp.h>
 #include <openssl/err.h>
 #include <openssl/provider.h>
+#include <oqs/oqs.h>
 
 #define PORT 1683
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 8192
+
+#define SIGNATURE_ALGORITHM OQS_SIG_alg_dilithium_5
 
 typedef struct
 {
@@ -18,10 +25,15 @@ typedef struct
     char *cert;
     char *key;
     char *ca_cert;
+    char *public_key_path;
+    char *private_key_path;
     int peer_fd;
     int server_fd;
     SSL_CTX *ctx;
     SSL *ssl;
+    OQS_SIG *sig;
+    uint8_t *public_key;
+    uint8_t *secret_key;
 } peer_t;
 
 bool peer_tcp_accept(peer_t *p)
@@ -230,28 +242,74 @@ bool peer_connect(peer_t *p)
 bool peer_read_file(peer_t *p)
 {
     int n;
-    char buf[BUFFER_SIZE]={0};
-    FILE *hash = fopen("received_hash.sha256", "wb");
-    n = SSL_read(p->ssl, buf, 64); // receiving first 64 characters of transmission (which is the hash of the file)
-    fwrite(buf, sizeof(char), n, hash);
-    fclose(hash);
-    FILE *file = fopen("received_file", "wb"); // "wb" for writing file in binary mode (allows for sending all possible data types)
-    while (true) 
+    char buf[BUFFER_SIZE] = {0};
+    uint8_t *received_signature = NULL;
+    size_t signature_len = 0;
+
+    n = SSL_read(p->ssl, buf, p->sig->length_signature);
+    if (n <= 0)
     {
-        n = SSL_read(p->ssl, buf, BUFFER_SIZE); // n is a number of bytes read
+        printf("błąd5\n");
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+
+    signature_len = n;
+    received_signature = malloc(signature_len);
+    if (received_signature == NULL)
+    {
+        printf("błąd6\n");
+        return false;
+    }
+    memcpy(received_signature, buf, signature_len);
+
+    FILE *signature_file = fopen("received_signature.sig", "wb");
+    if (signature_file == NULL)
+    {
+        printf("błąd7\n");
+        free(received_signature);
+        return false;
+    }
+    else
+    {
+        printf("Signature saved\n");
+    }
+
+    fwrite(received_signature, 1, signature_len, signature_file);
+    fclose(signature_file);
+
+    FILE *file = fopen("received_file", "wb");
+    if (file == NULL)
+    {
+        printf("błąd8\n");
+        free(received_signature);
+        return false;
+    }
+
+    while (true)
+    {
+        n = SSL_read(p->ssl, buf, BUFFER_SIZE);
         if (n <= 0)
         {
-            if (SSL_get_error(p->ssl, n) != SSL_ERROR_ZERO_RETURN)
+            int ssl_err = SSL_get_error(p->ssl, n);
+            if (ssl_err != SSL_ERROR_ZERO_RETURN)
             {
+                printf("błąd9\n");
                 ERR_print_errors_fp(stderr);
+                fclose(file);
+                free(received_signature);
                 return false;
             }
             printf("File transfer completed\n");
-            return true;
+            break;
         }
+
         fwrite(buf, sizeof(char), n, file);
     }
     fclose(file);
+
+    free(received_signature);
+
     return true;
 }
 
@@ -259,13 +317,13 @@ bool peer_read(peer_t *p)
 {
     printf("Select whether you expect to receive a file or a text message\n");
     printf("Type \"file\" to receive a file or \"text\" to receive a text message\n");
-    char mode[BUFFER_SIZE], buf[BUFFER_SIZE]={0};
+    char mode[BUFFER_SIZE], buf[BUFFER_SIZE] = {0};
     scanf("%s", mode);
-    if (strcmp( mode, "file" ) == 0) // strings are identical
+    if (strcmp(mode, "file") == 0) // strings are identical
     {
         return peer_read_file(p);
     }
-    else if (strcmp( mode, "text" ) != 0) // given text is neither "file" nor "text"
+    else if (strcmp(mode, "text") != 0) // given text is neither "file" nor "text"
     {
         printf("Invalid inpureadt\n");
         return false;
@@ -293,72 +351,140 @@ bool peer_read(peer_t *p)
 bool peer_send_file(peer_t *p)
 {
     printf("Enter the path of the file you want to send\n");
-    char file_path[BUFFER_SIZE], buf[BUFFER_SIZE]={0}, output_hash[32]={0}; // 32 is the length of the SHA256 hash
+    char file_path[BUFFER_SIZE], buf[BUFFER_SIZE] = {0};
     scanf("%s", file_path);
-    int n;
-    FILE *file = fopen(file_path, "rb"); // "rb" for reading file in binary mode (allows for sending all possible data types)
-    if (file == NULL) 
+
+    FILE *file = fopen(file_path, "rb");
+    if (file == NULL)
     {
-        perror("Unable to open file\n");
+        printf("błąd1");
         return false;
     }
-    size_t bytesRead;
-    SHA256_CTX sha256_ctx;
-    SHA256_Init(&sha256_ctx);
-    while ((bytesRead = fread(buf, sizeof(char), BUFFER_SIZE, file)) > 0)
-    { 
-        SHA256_Update(&sha256_ctx, buf, bytesRead);
-    }
-    SHA256_Final(output_hash, &sha256_ctx);
-    printf("%s\n", output_hash);
-    printf("Hash in hexadecimal: ");
-    char hash_hex[65]; // razem z null terminator
-    for (int i = 0; i < 32; i++) 
-    { // SHA256 returns 32 bytes which we convert into 64 hexadecimal characters
-        sprintf(&hash_hex[i * 2], "%02x", (unsigned char)output_hash[i]);
-    }
-    printf("%s\n", hash_hex);
-    printf("File hashed successfully\n");
-    n = SSL_write(p->ssl, hash_hex, 64); // we're sending 64 characters of hash
-    printf("File hash sent successfully\n");
 
-    rewind(file); // sets the pointer to the begginning of the file
-    while ((bytesRead = fread(buf, sizeof(char), BUFFER_SIZE, file)) > 0)
-    {  
-        n = SSL_write(p->ssl, buf, bytesRead);
-        if (n <= 0)
+    fseek(file, 0, SEEK_END);
+    long file_len = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    uint8_t *message = malloc(file_len);
+    fread(message, 1, file_len, file);
+    fclose(file);
+
+    uint8_t *signature = malloc(p->sig->length_signature);
+    size_t signature_len;
+
+    if (OQS_SIG_sign(p->sig, signature, &signature_len, message, file_len, p->secret_key) != OQS_SUCCESS)
+    {
+        printf("błąd5");
+        free(message);
+        free(signature);
+        return false;
+    }
+    printf("Plik został podpisany\n");
+
+    if (SSL_write(p->ssl, signature, signature_len) <= 0)
+    {
+        printf("błąd6");
+        free(message);
+        free(signature);
+        return false;
+    }
+
+    file = fopen(file_path, "rb");
+    size_t n;
+    while ((n = fread(buf, 1, BUFFER_SIZE, file)) > 0)
+    {
+        if (SSL_write(p->ssl, buf, n) <= 0)
         {
-            if (SSL_get_error(p->ssl, n) != SSL_ERROR_ZERO_RETURN)
-            {
-                ERR_print_errors_fp(stderr);
-                return false;
-            }
-            return true;
+            printf("błąd7");
+            fclose(file);
+            free(message);
+            free(signature);
+            return false;
         }
     }
-    printf("File sent successfully\n");
+
     fclose(file);
+    printf("File sent successfully\n");
+
+    free(message);
+    free(signature);
+
+    return true;
+}
+
+bool peer_sig_init(peer_t *p)
+{
+    OQS_SIG *sig = OQS_SIG_new(SIGNATURE_ALGORITHM);
+    if (sig == NULL)
+    {
+        return false;
+    }
+
+    FILE *key_file = fopen(p->private_key_path, "r");
+
+    FILE *public_key_file = fopen(p->public_key_path, "r");
+    if (!public_key_file || !key_file)
+    {
+        perror("Failed to open key file");
+        return false;
+    }
+
+    EVP_PKEY *pkey = PEM_read_PrivateKey(key_file, NULL, NULL, NULL);
+    fclose(key_file);
+
+    EVP_PKEY *public_key = PEM_read_PUBKEY(public_key_file, NULL, NULL, NULL);
+    fclose(public_key_file);
+
+    if (!pkey || !public_key)
+    {
+        fprintf(stderr, "Error reading private key\n");
+        return false;
+    }
+
+    uint8_t *priv_key = malloc(sig->length_secret_key);
+    uint8_t *pub_key = malloc(sig->length_public_key);
+
+    size_t priv_key_len = sig->length_secret_key;
+    size_t pub_key_len = sig->length_public_key;
+
+    if (EVP_PKEY_get_raw_private_key(pkey, priv_key, &priv_key_len) <= 0 ||
+        EVP_PKEY_get_raw_public_key(public_key, pub_key, &pub_key_len) <= 0)
+    {
+        fprintf(stderr, "Failed to extract raw keys\n");
+        free(priv_key);
+        free(pub_key);
+        EVP_PKEY_free(pkey);
+        EVP_PKEY_free(public_key);
+        return false;
+    }
+
+    p->public_key = pub_key;
+    p->secret_key = priv_key;
+    p->sig = sig;
+
+    EVP_PKEY_free(pkey);
+    EVP_PKEY_free(public_key);
     return true;
 }
 
 bool peer_write(peer_t *p)
-{   
+{
     char mode[BUFFER_SIZE];
     printf("Choose whether you want to send a file or a text message\n");
     printf("Type \"file\" to send a file or \"text\" to send a text message\n");
     scanf("%s", mode);
-    if (strcmp( mode, "file" ) == 0)
+    if (strcmp(mode, "file") == 0)
     {
         return peer_send_file(p);
     }
-    else if (strcmp( mode, "text" ) != 0)
+    else if (strcmp(mode, "text") != 0)
     {
         printf("Invalid inputwrite\n");
         return false;
     }
     printf("reading from stdin...\n");
     printf("type \"quit\" to exit\n");
-    char buf[BUFFER_SIZE]={0};
+    char buf[BUFFER_SIZE] = {0};
     int buf_len, n;
     while (true)
     {
@@ -392,11 +518,21 @@ bool peer_write(peer_t *p)
 
 bool peer_close(peer_t *p)
 {
+    free(p->public_key);
+    free(p->secret_key);
+    OQS_SIG_free(p->sig);
     return peer_tls_close(p) && peer_tcp_close(p);
 }
 
 bool peer_run(peer_t *p)
 {
+
+    if (!peer_sig_init(p))
+    {
+
+        return false;
+    }
+    printf("Klucze zostały stworzone\n");
     if (peer_connect(p))
     {
         if (peer_read(p))
@@ -428,9 +564,9 @@ bool peer_run(peer_t *p)
 
 int main(int argc, char **argv)
 {
-    if (argc != 5)
+    if (argc != 7)
     {
-        fprintf(stderr, "usage: %s <addr> <cert> <key> <ca-cert>\n", argv[0]);
+        fprintf(stderr, "usage: %s <addr> <cert> <key> <ca-cert> <public-key> <private-key>\n", argv[0]);
         return EXIT_FAILURE;
     }
     peer_t peer = {
@@ -438,6 +574,11 @@ int main(int argc, char **argv)
         .cert = argv[2],
         .key = argv[3],
         .ca_cert = argv[4],
+        .private_key_path = argv[6],
+        .public_key_path = argv[5],
+        .public_key = NULL,
+        .secret_key = NULL,
+        .sig = NULL,
         .peer_fd = -1,
         .server_fd = -1,
         .ctx = NULL,
