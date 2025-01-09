@@ -2,12 +2,10 @@
 
 ### COMMANDS 
 ```bash
-# generowanie klucza prywatnego
-openssl genpkey -algorithm dilithium5 -out private_key.pem -provider oqsprovider -provider default
-# wyciąganie klucza publicznego z klucza prywatnego
-openssl pkey -provider oqsprovider -provider default -in private_key.pem -pubout -out public_key.pem
+# generowanie kluczy
+openssl genpkey -algorithm dilithium5 -out private_key.pem -provider oqsprovider -provider default -outpubkey public_key.pem -aes256
 # weryfikacja podpisu pliku
-openssl pkeyutl -verify -pubin -inkey .dev/bob/public_key.pem -in .dev/alice/received_file -sigfile .dev/alice received_signature.sig -provider oqsprovider -provider default
+openssl pkeyutl -verify -pubin -inkey .dev/bob/public_key.pem -in .dev/alice/received_file -sigfile .dev/alice/received_signature.sig -provider oqsprovider -provider default
 ```
 
 ### FILE.IO

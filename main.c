@@ -532,7 +532,6 @@ bool peer_run(peer_t *p)
 
         return false;
     }
-    printf("Klucze zostały stworzone\n");
     if (peer_connect(p))
     {
         if (peer_read(p))
