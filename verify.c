@@ -43,19 +43,19 @@ bool read_file(const char *file_path, uint8_t **buf, long *size)
 bool peer_sig_init(char *public_key_path, uint8_t **PUBLIC_KEY, OQS_SIG *sig)
 {
 
-    FILE *public_key_file = fopen(public_key_path, "r");
+    FILE *public_key_file = fopen(public_key_path, "rb");
     if (!public_key_file)
     {
         perror("Failed to open key file");
         return false;
     }
-
     EVP_PKEY *public_key = PEM_read_PUBKEY(public_key_file, NULL, NULL, NULL);
     fclose(public_key_file);
 
     if (!public_key)
     {
         fprintf(stderr, "Error reading public key\n");
+        ERR_print_errors_fp(stderr);
         return false;
     }
 
@@ -70,6 +70,7 @@ bool peer_sig_init(char *public_key_path, uint8_t **PUBLIC_KEY, OQS_SIG *sig)
         EVP_PKEY_free(public_key);
         return false;
     }
+
     *PUBLIC_KEY = pub_key;
 
     EVP_PKEY_free(public_key);
@@ -88,19 +89,32 @@ int main(int argc, char **argv)
     const char *signature_path = argv[2];
     char *public_key_path = argv[3];
 
+    OSSL_PROVIDER *default_prov = OSSL_PROVIDER_load(NULL, "default");
+    if (default_prov == NULL)
+    {
+        ERR_print_errors_fp(stderr);
+        return EXIT_FAILURE;
+    }
+    OSSL_PROVIDER *oqs_prov = OSSL_PROVIDER_load(NULL, "oqsprovider");
+    if (oqs_prov == NULL)
+    {
+        ERR_print_errors_fp(stderr);
+        return EXIT_FAILURE;
+    }
+
     OQS_SIG *sig = OQS_SIG_new(SIGNATURE_ALGORITHM);
 
     if (sig == NULL)
     {
+        fprintf(stderr, "Failed to initialize signature algorithm\n");
         return EXIT_FAILURE;
     }
 
-    uint8_t *message;
-    long message_len;
-    uint8_t *received_signature;
-    long signature_len;
-    uint8_t *public_key;
-    long public_key_len;
+    uint8_t *message = NULL;
+    long message_len = 0;
+    uint8_t *received_signature = NULL;
+    long signature_len = 0;
+    uint8_t *public_key = NULL;
 
     if (!read_file(file_path, &message, &message_len) ||
         !read_file(signature_path, &received_signature, &signature_len))
@@ -114,7 +128,6 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "Failed to initialize signature\n");
         free(received_signature);
-        free(public_key);
         free(message);
         OQS_SIG_free(sig);
         return EXIT_FAILURE;
@@ -136,6 +149,8 @@ int main(int argc, char **argv)
     free(public_key);
     free(message);
     OQS_SIG_free(sig);
+    OSSL_PROVIDER_unload(default_prov);
+    OSSL_PROVIDER_unload(oqs_prov);
 
     return EXIT_SUCCESS;
 }
