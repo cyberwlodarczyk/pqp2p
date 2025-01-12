@@ -1,11 +1,9 @@
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <openssl/ssl.h>
@@ -17,41 +15,93 @@
 #include <oqs/oqs.h>
 
 #define PORT 1683
-#define BUFFER_SIZE 8192
-
+#define BUFFER_SIZE 4096
 #define SIGNATURE_ALGORITHM OQS_SIG_alg_dilithium_5
+#define SIGNATURE_EXTENSION ".sig"
+#define SIGNATURE_EXTENSION_LENGTH (sizeof(SIGNATURE_EXTENSION) - 1)
+#define MAX_FILENAME_LENGTH 255
+#define QUIT_KEYWORD "quit"
+#define QUIT_KEYWORD_LENGTH (sizeof(QUIT_KEYWORD) - 1)
 
-const char MSG_TEXT = 0b00000001;
-const char MSG_FILE = 0b00000010;
+char *add_sig_ext(char *filename)
+{
+    size_t filename_len = strlen(filename);
+    size_t len = filename_len + SIGNATURE_EXTENSION_LENGTH;
+    char *result = malloc(len + 1);
+    if (result == NULL)
+    {
+        return NULL;
+    }
+    memcpy(result, filename, filename_len);
+    memcpy(result + filename_len, SIGNATURE_EXTENSION, SIGNATURE_EXTENSION_LENGTH);
+    result[len] = '\0';
+    return result;
+}
 
 typedef struct
 {
-    int my_port;
-    int other_port;
     char *addr;
     char *cert;
-    char *key;
+    char *cert_pkey;
     char *ca_cert;
-    char *public_key_path;
-    char *private_key_path;
+    char *sig_pkey;
     int peer_fd;
-    int peer_accept_fd;
-    int peer_connect_fd;
     int server_fd;
+    OQS_SIG *sig;
+    uint8_t *sig_pkey_buf;
     SSL_CTX *ctx;
     SSL *ssl;
-    OQS_SIG *sig;
-    uint8_t *public_key;
-    uint8_t *secret_key;
 } peer_t;
 
-char *substr(char *src, size_t from, size_t to)
+bool peer_sig_init(peer_t *p)
 {
-    size_t sublen = to - from;
-    char *sub = malloc(sublen + 1);
-    memcpy(sub, src + from, sublen);
-    sub[sublen] = '\0';
-    return sub;
+    FILE *pkey_file = fopen(p->sig_pkey, "rb");
+    if (pkey_file == NULL)
+    {
+        perror(p->sig_pkey);
+        return false;
+    }
+    EVP_PKEY *pkey_evp = PEM_read_PrivateKey(pkey_file, NULL, NULL, NULL);
+    if (pkey_evp == NULL)
+    {
+        ERR_print_errors_fp(stderr);
+        fclose(pkey_file);
+        return false;
+    }
+    if (fclose(pkey_file) != 0)
+    {
+        perror("fclose");
+        EVP_PKEY_free(pkey_evp);
+        return false;
+    }
+    OQS_SIG *sig = OQS_SIG_new(SIGNATURE_ALGORITHM);
+    size_t pkey_len = sig->length_secret_key;
+    uint8_t *pkey_buf = malloc(pkey_len);
+    if (pkey_buf == NULL)
+    {
+        perror("malloc");
+        OQS_SIG_free(sig);
+        EVP_PKEY_free(pkey_evp);
+        return false;
+    }
+    if (EVP_PKEY_get_raw_private_key(pkey_evp, pkey_buf, &pkey_len) != 1)
+    {
+        ERR_print_errors_fp(stderr);
+        free(pkey_buf);
+        OQS_SIG_free(sig);
+        EVP_PKEY_free(pkey_evp);
+        return false;
+    }
+    EVP_PKEY_free(pkey_evp);
+    p->sig = sig;
+    p->sig_pkey_buf = pkey_buf;
+    return true;
+}
+
+void peer_sig_free(peer_t *p)
+{
+    free(p->sig_pkey_buf);
+    OQS_SIG_free(p->sig);
 }
 
 bool peer_tcp_accept(peer_t *p)
@@ -76,11 +126,11 @@ bool peer_tcp_accept(peer_t *p)
         return false;
     }
     struct sockaddr_in server_addr;
-    int server_addr_len = sizeof(server_addr);
+    socklen_t server_addr_len = sizeof(server_addr);
     memset(&server_addr, 0, server_addr_len);
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(p->my_port);
+    server_addr.sin_port = htons(PORT);
     if (bind(
             server_fd,
             (struct sockaddr *)&server_addr,
@@ -96,7 +146,7 @@ bool peer_tcp_accept(peer_t *p)
         close(server_fd);
         return false;
     }
-    printf("listening on 0.0.0.0:%d...\n", p->my_port);
+    printf("listening on 0.0.0.0:%d...\n", PORT);
     struct sockaddr_in peer_addr;
     socklen_t peer_addr_len = sizeof(peer_addr);
     int peer_fd = accept(
@@ -121,42 +171,37 @@ bool peer_tcp_accept(peer_t *p)
 
 bool peer_tcp_connect(peer_t *p)
 {
-    while(true)
+    int peer_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (peer_fd == -1)
     {
-        int peer_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (peer_fd == -1)
-        {
-            perror("socket");
-            return false;
-        }
-        struct sockaddr_in peer_addr;
-        int peer_addr_len = sizeof(peer_addr);
-        memset(&peer_addr, 0, peer_addr_len);
-        peer_addr.sin_family = AF_INET;
-        peer_addr.sin_port = htons(p->other_port);
-        if (inet_pton(AF_INET, p->addr, &peer_addr.sin_addr) == 0)
-        {
-            fprintf(stderr, "invalid peer address: %s\n", p->addr);
-            close(peer_fd);
-            return false;
-        }
-        if (connect(peer_fd, (struct sockaddr *)(&peer_addr), peer_addr_len) == -1)
-        {
-            printf("could not connect to %s:%d\n", p->addr, p->other_port);
-            close(peer_fd);
-            sleep(1);
-            continue;
-        }
-        p->peer_fd = peer_fd;
-        printf("connected to %s:%d\n", p->addr, p->other_port);
-        return true;
+        perror("socket");
+        return false;
     }
+    p->peer_fd = peer_fd;
+    struct sockaddr_in peer_addr;
+    socklen_t peer_addr_len = sizeof(peer_addr);
+    memset(&peer_addr, 0, peer_addr_len);
+    peer_addr.sin_family = AF_INET;
+    peer_addr.sin_port = htons(PORT);
+    if (inet_pton(AF_INET, p->addr, &peer_addr.sin_addr) == 0)
+    {
+        fprintf(stderr, "invalid peer address: %s\n", p->addr);
+        close(peer_fd);
+        return false;
+    }
+    if (connect(peer_fd, (struct sockaddr *)(&peer_addr), peer_addr_len) == -1)
+    {
+        printf("could not connect to %s:%d\n", p->addr, PORT);
+        close(peer_fd);
+        return false;
+    }
+    printf("connected to %s:%d\n", p->addr, PORT);
+    return true;
 }
 
 bool peer_tcp_close(peer_t *p)
 {
-    if ((p->peer_fd != -1 && close(p->peer_fd) == -1) ||
-        (p->server_fd != -1 && close(p->server_fd) == -1))
+    if (close(p->peer_fd) != 0 || (p->server_fd != -1 && close(p->server_fd) != 0))
     {
         perror("close");
         return false;
@@ -177,7 +222,7 @@ bool peer_tls_init(peer_t *p, const SSL_METHOD *meth, int mode, int (*handshake_
     {
         return false;
     }
-    if (SSL_CTX_use_PrivateKey_file(ctx, p->key, SSL_FILETYPE_PEM) != 1)
+    if (SSL_CTX_use_PrivateKey_file(ctx, p->cert_pkey, SSL_FILETYPE_PEM) != 1)
     {
         return false;
     }
@@ -209,6 +254,36 @@ bool peer_tls_init(peer_t *p, const SSL_METHOD *meth, int mode, int (*handshake_
     return true;
 }
 
+int peer_tls_read(peer_t *p, void *buf, int n)
+{
+    int k = SSL_read(p->ssl, buf, n);
+    if (k <= 0)
+    {
+        if (SSL_get_error(p->ssl, k) == SSL_ERROR_ZERO_RETURN)
+        {
+            return 0;
+        }
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+    return 1;
+}
+
+int peer_tls_write(peer_t *p, const void *buf, int n)
+{
+    int k = SSL_write(p->ssl, buf, n);
+    if (k <= 0)
+    {
+        if (SSL_get_error(p->ssl, k) == SSL_ERROR_ZERO_RETURN)
+        {
+            return 0;
+        }
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+    return 1;
+}
+
 bool peer_tls_accept(peer_t *p)
 {
     if (!peer_tls_init(
@@ -233,22 +308,31 @@ bool peer_tls_connect(peer_t *p)
     return true;
 }
 
+bool peer_tls_shutdown(peer_t *p)
+{
+    int n = SSL_shutdown(p->ssl);
+    if (n == 1)
+    {
+        return true;
+    }
+    if (n == 0)
+    {
+        n = SSL_shutdown(p->ssl);
+    }
+    if (n == 1)
+    {
+        return true;
+    }
+    ERR_print_errors_fp(stderr);
+    return false;
+}
+
 bool peer_tls_close(peer_t *p)
 {
-    if (p->ssl != NULL)
-    {
-        if (SSL_shutdown(p->ssl) != 1)
-        {
-            ERR_print_errors_fp(stderr);
-            return false;
-        }
-        SSL_free(p->ssl);
-    }
-    if (p->ctx != NULL)
-    {
-        SSL_CTX_free(p->ctx);
-    }
-    return true;
+    bool ok = peer_tls_shutdown(p);
+    SSL_free(p->ssl);
+    SSL_CTX_free(p->ctx);
+    return ok;
 }
 
 bool peer_accept(peer_t *p)
@@ -261,361 +345,389 @@ bool peer_connect(peer_t *p)
     return peer_tcp_connect(p) && peer_tls_connect(p);
 }
 
-bool peer_read_file(peer_t *p)
+char *peer_read_filename(peer_t *p)
 {
-    int n;
-    char buf[BUFFER_SIZE] = {0};
-    uint8_t *received_signature = NULL;
-    size_t signature_len = 0;
-
-    n = SSL_read(p->ssl, buf, p->sig->length_signature);
-    if (n <= 0)
+    uint8_t *filename_len = malloc(1);
+    if (filename_len == NULL)
     {
-        printf("błąd5\n");
-        ERR_print_errors_fp(stderr);
-        return false;
+        perror("malloc");
+        return NULL;
     }
-
-    signature_len = n;
-    received_signature = malloc(signature_len);
-    if (received_signature == NULL)
+    if (peer_tls_read(p, filename_len, 1) != 1)
     {
-        printf("błąd6\n");
-        return false;
+        free(filename_len);
+        return NULL;
     }
-    memcpy(received_signature, buf, signature_len);
-
-    FILE *signature_file = fopen("received_signature.sig", "wb");
-    if (signature_file == NULL)
+    char *filename = malloc(*filename_len + 1);
+    if (filename == NULL)
     {
-        printf("błąd7\n");
-        free(received_signature);
-        return false;
+        perror("malloc");
+        free(filename_len);
+        return NULL;
     }
-    else
+    if (*filename_len == 0)
     {
-        printf("Signature saved\n");
+        filename[0] = '\0';
+        free(filename_len);
+        return filename;
     }
+    if (peer_tls_read(p, filename, *filename_len) != 1)
+    {
+        free(filename);
+        free(filename_len);
+        return NULL;
+    }
+    filename[*filename_len] = '\0';
+    free(filename_len);
+    return filename;
+}
 
-    fwrite(received_signature, 1, signature_len, signature_file);
-    fclose(signature_file);
+size_t peer_read_file_len(peer_t *p)
+{
+    const int n = sizeof(size_t);
+    uint8_t buf[n];
+    if (peer_tls_read(p, buf, n) != 1)
+    {
+        return -1;
+    }
+    size_t len;
+    memcpy(&len, buf, n);
+    return len;
+}
 
-    FILE *file = fopen("received_file", "wb");
+bool peer_read_file(peer_t *p, char *filename)
+{
+    FILE *file = fopen(filename, "wb");
     if (file == NULL)
     {
-        printf("błąd8\n");
-        free(received_signature);
+        perror(filename);
         return false;
     }
-
+    size_t file_len = peer_read_file_len(p);
+    if (file_len == -1)
+    {
+        fclose(file);
+        return false;
+    }
+    int n;
+    uint8_t buf[BUFFER_SIZE];
     while (true)
     {
-        n = SSL_read(p->ssl, buf, BUFFER_SIZE);
-        if (n <= 0)
+        n = file_len < BUFFER_SIZE ? file_len : BUFFER_SIZE;
+        if (peer_tls_read(p, buf, n) != 1)
         {
-            int ssl_err = SSL_get_error(p->ssl, n);
-            if (ssl_err != SSL_ERROR_ZERO_RETURN)
+            fclose(file);
+            return false;
+        }
+        if (fwrite(buf, 1, n, file) != n)
+        {
+            perror("fwrite");
+            fclose(file);
+            return false;
+        }
+        if (file_len <= BUFFER_SIZE)
+        {
+            if (fclose(file) != 0)
             {
-                printf("błąd9\n");
-                ERR_print_errors_fp(stderr);
-                fclose(file);
-                free(received_signature);
+                perror("fclose");
                 return false;
             }
-            printf("File transfer completed\n");
-            break;
+            return true;
         }
-
-        fwrite(buf, sizeof(char), n, file);
+        file_len -= BUFFER_SIZE;
     }
-    fclose(file);
+}
 
-    free(received_signature);
-
+bool peer_read_sig(peer_t *p, char *filename)
+{
+    size_t sig_len = p->sig->length_signature;
+    uint8_t *sig = malloc(sig_len);
+    if (sig == NULL)
+    {
+        perror("malloc");
+        return false;
+    }
+    if (peer_tls_read(p, sig, sig_len) != 1)
+    {
+        free(sig);
+        return false;
+    }
+    char *sig_filename = add_sig_ext(filename);
+    if (sig_filename == NULL)
+    {
+        free(sig);
+        return false;
+    }
+    FILE *sig_file = fopen(sig_filename, "wb");
+    if (sig_file == NULL)
+    {
+        free(sig_filename);
+        free(sig);
+        return false;
+    }
+    free(sig_filename);
+    if (fwrite(sig, 1, sig_len, sig_file) != sig_len)
+    {
+        perror("fwrite");
+        fclose(sig_file);
+        free(sig);
+        return false;
+    }
+    free(sig);
+    if (fclose(sig_file) != 0)
+    {
+        perror("fclose");
+        return false;
+    }
     return true;
 }
 
 bool peer_read(peer_t *p)
 {
-    char mode;
-    int n;
+    printf("waiting for files...\n");
     while (true)
     {
-        SSL_read(p->ssl, &mode, 1);
-        if(mode & MSG_FILE) 
+        char *filename = peer_read_filename(p);
+        if (filename == NULL)
         {
-            peer_read_file(p);
-        }
-        else if (mode & MSG_TEXT)
-        {
-            char buf[BUFFER_SIZE] = {0};
-            n = SSL_read(p->ssl, buf, BUFFER_SIZE - 1);
-            if (n <= 0)
-            {
-                if (SSL_get_error(p->ssl, n) != SSL_ERROR_ZERO_RETURN)
-                {
-                    ERR_print_errors_fp(stderr);
-                    return false;
-                }
-                printf("connection closed by remote peer\n");
-                return true;
-            }
-            buf[n] = '\0';
-            printf("\r%s", buf);
-            printf("> ");
-            fflush(stdout);
-        }
-        else
-        {
-            fprintf(stderr, "Invalid message received\n");
             return false;
         }
+        if (filename[0] == '\0')
+        {
+            free(filename);
+            printf("done\n");
+            return true;
+        }
+        if (!peer_read_file(p, filename) || !peer_read_sig(p, filename))
+        {
+            free(filename);
+            return false;
+        }
+        printf("< %s\n", filename);
+        free(filename);
     }
 }
 
-bool peer_send_file(peer_t *p, char *file_path)
+char *peer_write_filename(peer_t *p)
 {
-    char buf[BUFFER_SIZE] = {0};
-
-    FILE *file = fopen(file_path, "rb");
-    if (file == NULL)
+    char *filename = malloc(MAX_FILENAME_LENGTH + 1);
+    if (filename == NULL)
     {
-        printf("Nie odnaleziono pliku o nazwie: '%s'\n", file_path);
-        return false;
+        return NULL;
     }
-
-    fseek(file, 0, SEEK_END);
-    long file_len = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    uint8_t *message = malloc(file_len);
-    fread(message, 1, file_len, file);
-    fclose(file);
-
-    uint8_t *signature = malloc(p->sig->length_signature);
-    size_t signature_len;
-
-    if (OQS_SIG_sign(p->sig, signature, &signature_len, message, file_len, p->secret_key) != OQS_SUCCESS)
+    printf("> ");
+    fflush(stdout);
+    if (fgets(filename, MAX_FILENAME_LENGTH + 1, stdin) == NULL)
     {
-        printf("błąd5");
-        free(message);
-        free(signature);
-        return false;
+        perror("fgets");
+        free(filename);
+        return NULL;
     }
-    printf("Plik został podpisany\n");
-
-    SSL_write(p->ssl, &MSG_FILE, 1);
-    if (SSL_write(p->ssl, signature, signature_len) <= 0)
+    filename[strcspn(filename, "\n")] = '\0';
+    if (strchr(filename, '/') != NULL)
     {
-        printf("błąd6");
-        free(message);
-        free(signature);
-        return false;
+        printf("invalid filename\n");
+        free(filename);
+        return NULL;
     }
-
-    file = fopen(file_path, "rb");
-    size_t n;
-    while ((n = fread(buf, 1, BUFFER_SIZE, file)) > 0)
+    uint8_t filename_len = strlen(filename);
+    if (filename_len == QUIT_KEYWORD_LENGTH && strcmp(filename, QUIT_KEYWORD) == 0)
     {
-        if (SSL_write(p->ssl, buf, n) <= 0)
-        {
-            printf("błąd7");
-            fclose(file);
-            free(message);
-            free(signature);
-            return false;
-        }
+        filename_len = 0;
+        filename[0] = '\0';
     }
-
-    fclose(file);
-    printf("File sent successfully\n");
-
-    free(message);
-    free(signature);
-
-    return true;
+    if (peer_tls_write(p, &filename_len, 1) != 1 || (filename_len != 0 && peer_tls_write(p, filename, filename_len) != 1))
+    {
+        free(filename);
+        return NULL;
+    }
+    return filename;
 }
 
-bool peer_sig_init(peer_t *p)
+size_t peer_write_file_len(peer_t *p, FILE *file)
 {
-    OQS_SIG *sig = OQS_SIG_new(SIGNATURE_ALGORITHM);
+    const int n = sizeof(size_t);
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        perror("fseek");
+        return -1;
+    }
+    size_t len = ftell(file);
+    if (len == -1)
+    {
+        perror("ftell");
+        return -1;
+    }
+    if (fseek(file, 0, SEEK_SET) != 0)
+    {
+        perror("fseek");
+        return -1;
+    }
+    uint8_t buf[n];
+    memcpy(buf, &len, n);
+    if (peer_tls_write(p, buf, n) != 1)
+    {
+        return -1;
+    }
+    return len;
+}
+
+uint8_t *peer_write_file(peer_t *p, FILE *file, size_t file_len)
+{
+    uint8_t *content = malloc(file_len);
+    if (content == NULL)
+    {
+        return NULL;
+    }
+    if (fread(content, 1, file_len, file) != file_len)
+    {
+        perror("fread");
+        free(content);
+        return NULL;
+    }
+    if (peer_tls_write(p, content, file_len) != 1)
+    {
+        free(content);
+        return NULL;
+    }
+    return content;
+}
+
+bool peer_write_sig(peer_t *p, uint8_t *file_content, size_t file_len)
+{
+    size_t sig_len = p->sig->length_signature;
+    uint8_t *sig = malloc(sig_len);
     if (sig == NULL)
     {
         return false;
     }
-
-    FILE *key_file = fopen(p->private_key_path, "r");
-
-    FILE *public_key_file = fopen(p->public_key_path, "r");
-    if (!public_key_file || !key_file)
+    if (OQS_SIG_sign(p->sig, sig, &sig_len, file_content, file_len, p->sig_pkey_buf) != OQS_SUCCESS)
     {
-        perror("Failed to open key file");
+        free(sig);
         return false;
     }
-
-    EVP_PKEY *pkey = PEM_read_PrivateKey(key_file, NULL, NULL, NULL);
-    fclose(key_file);
-
-    EVP_PKEY *public_key = PEM_read_PUBKEY(public_key_file, NULL, NULL, NULL);
-    fclose(public_key_file);
-
-    if (!pkey || !public_key)
+    if (peer_tls_write(p, sig, sig_len) != 1)
     {
-        fprintf(stderr, "Error reading private key\n");
+        free(sig);
         return false;
     }
-
-    uint8_t *priv_key = malloc(sig->length_secret_key);
-    uint8_t *pub_key = malloc(sig->length_public_key);
-
-    size_t priv_key_len = sig->length_secret_key;
-    size_t pub_key_len = sig->length_public_key;
-
-    if (EVP_PKEY_get_raw_private_key(pkey, priv_key, &priv_key_len) <= 0 ||
-        EVP_PKEY_get_raw_public_key(public_key, pub_key, &pub_key_len) <= 0)
-    {
-        fprintf(stderr, "Failed to extract raw keys\n");
-        free(priv_key);
-        free(pub_key);
-        EVP_PKEY_free(pkey);
-        EVP_PKEY_free(public_key);
-        return false;
-    }
-
-    p->public_key = pub_key;
-    p->secret_key = priv_key;
-    p->sig = sig;
-
-    EVP_PKEY_free(pkey);
-    EVP_PKEY_free(public_key);
+    free(sig);
     return true;
 }
 
 bool peer_write(peer_t *p)
 {
-    printf("type \"quit\" to exit\n");
+    printf("enter file names to send\n");
+    printf("type \"%s\" or an empty string to exit\n", QUIT_KEYWORD);
     while (true)
     {
-        char buf[BUFFER_SIZE] = {0};
-        int buf_len, n;
-        printf("> ");
-        fflush(stdout);
-        if (fgets(buf, BUFFER_SIZE, stdin) == NULL)
+        char *filename = peer_write_filename(p);
+        if (filename == NULL)
         {
-            if (!feof(stdin))
-            {
-                perror("fgets");
-                return false;
-            }
+            return false;
+        }
+        if (filename[0] == '\0')
+        {
+            free(filename);
             return true;
         }
-        buf_len = strlen(buf);
-        char *file_cmd = "/file ";
-        int file_cmd_len = strlen(file_cmd);
-        if(strncmp(file_cmd, buf, file_cmd_len) == 0)
+        FILE *file = fopen(filename, "rb");
+        if (file == NULL)
         {
-            char *filename = substr(buf, file_cmd_len, buf_len - 1);
-            peer_send_file(p, filename);
+            perror(filename);
             free(filename);
+            return false;
         }
-        else
+        free(filename);
+        size_t file_len = peer_write_file_len(p, file);
+        if (file_len == -1)
         {
-            if (buf_len == 5 && strncmp(buf, "quit\n", 5) == 0)
-            {
-                printf("exiting...\n");
-                kill(getppid(), 9);
-                exit(EXIT_SUCCESS);
-            }
-            SSL_write(p->ssl, &MSG_TEXT, 1);
-            n = SSL_write(p->ssl, buf, buf_len);
-            if (n < 0 || (buf_len == 0 && n == 0))
-            {
-                if (SSL_get_error(p->ssl, n) != SSL_ERROR_ZERO_RETURN)
-                {
-                    ERR_print_errors_fp(stderr);
-                    return false;
-                }
-            }
+            fclose(file);
+            return false;
+        }
+        uint8_t *file_content = peer_write_file(p, file, file_len);
+        if (file_content == NULL)
+        {
+            fclose(file);
+            return false;
+        }
+        if (!peer_write_sig(p, file_content, file_len))
+        {
+            fclose(file);
+            free(file_content);
+            return false;
+        }
+        free(file_content);
+        if (fclose(file) != 0)
+        {
+            perror("fclose");
+            return false;
         }
     }
 }
 
 bool peer_close(peer_t *p)
 {
-    free(p->public_key);
-    free(p->secret_key);
-    OQS_SIG_free(p->sig);
-    return peer_tls_close(p) && peer_tcp_close(p);
+    if (!peer_tls_close(p) || !peer_tcp_close(p))
+    {
+        return false;
+    }
+    peer_sig_free(p);
+    return true;
 }
 
-peer_t *peer_config;
-void recipient(void *_arg)
-{
-    if (!peer_connect(peer_config)) {
-      return;
-    }
-    peer_read(peer_config);
-    peer_close(peer_config);
-    return;
-}
-void sender(void *_arg)
-{
-    if (!peer_accept(peer_config)) {
-      return;
-    }
-    peer_write(peer_config);
-    peer_close(peer_config);
-    return;
- }
 bool peer_run(peer_t *p)
 {
     if (!peer_sig_init(p))
     {
         return false;
     }
-    peer_config = p;
-    pthread_t recipient_id, sender_id;
-    int sender_pid = fork();
-    if(sender_pid == 0) {
-      sender(NULL);
-    }
-    int recipient_pid = fork();
-    if(recipient_pid == 0)
+    if (peer_connect(p))
     {
-      recipient(NULL);
+        if (peer_read(p))
+        {
+            if (peer_close(p))
+            {
+                return true;
+            }
+            return false;
+        }
+        peer_close(p);
+        return false;
     }
-    waitpid(sender_pid, NULL, 0);
-    waitpid(recipient_pid, NULL, 0);
-    return true;
+    if (peer_accept(p))
+    {
+        if (peer_write(p))
+        {
+            if (peer_close(p))
+            {
+                return true;
+            }
+            return false;
+        }
+        peer_close(p);
+        return false;
+    }
+    return false;
 }
 
-int main(int argc, char **argv)
+int run(int argc, char **argv)
 {
-    if (argc != 9)
+    if (argc != 6)
     {
-        fprintf(stderr, "usage: %s <my-port> <other-addr> <other-port> <cert> <key> <ca-cert> <public-key> <private-key>\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-    int my_port = atoi(argv[1]),other_port = atoi(argv[3]);
-    if(my_port == 0 || other_port == 0) 
-    {
-        fprintf(stderr, "Not number given as port\n");
+        fprintf(stderr, "usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>\n", argv[0]);
         return EXIT_FAILURE;
     }
     peer_t peer = {
-        .my_port = my_port,
-        .addr = argv[2],
-        .other_port = other_port,
-        .cert = argv[4],
-        .key = argv[5],
-        .ca_cert = argv[6],
-        .public_key_path = argv[7],
-        .private_key_path = argv[8],
-        .public_key = NULL,
-        .secret_key = NULL,
-        .sig = NULL,
+        .addr = argv[1],
+        .cert = argv[2],
+        .cert_pkey = argv[3],
+        .ca_cert = argv[4],
+        .sig_pkey = argv[5],
         .peer_fd = -1,
         .server_fd = -1,
+        .sig = NULL,
+        .sig_pkey_buf = NULL,
         .ctx = NULL,
         .ssl = NULL,
     };
@@ -648,4 +760,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
+}
+
+int main(int argc, char **argv)
+{
+    int code = run(argc, argv);
+    printf("exit status %d\n", code);
+    return code;
 }

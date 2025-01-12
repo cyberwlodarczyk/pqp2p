@@ -1,19 +1,25 @@
 # Post-Quantum P2P
 
-### COMMANDS 
+### OpenSSL
+
 ```bash
-# generowanie kluczy
-openssl genpkey -algorithm dilithium5 -out private_key.pem -provider oqsprovider -provider default -outpubkey public_key.pem -aes256
-# weryfikacja podpisu pliku
-openssl pkeyutl -verify -pubin -inkey .dev/bob/public_key.pem -in .dev/alice/received_file -sigfile .dev/alice/received_signature.sig -provider oqsprovider -provider default
+# create private key and self-signed root certificate for the certificate authority
+openssl req -x509 -new -newkey dilithium5 -keyout ca-cert-pkey.pem -out ca-cert.pem
+# create private key and certificate signing request for the peer
+openssl req -new -newkey dilithium5 -keyout cert-pkey.pem -out csr.pem
+# issue certificate from the certificate authority
+openssl ca -in csr.pem -out cert.pem -cert ca-cert.pem -keyfile ca-cert-pkey.pem
+# generate public-private key pair
+openssl genpkey -algorithm dilithium5 -out sig-pkey.pem -outpubkey sig-pubkey.pem -aes256
+# verify file signature
+openssl pkeyutl -verify -pubin -inkey sig-pubkey.pem -in data.txt -sigfile data.txt.sig
 ```
 
-### FILE.IO
+### [file.io](https://www.file.io/)
+
 ```bash
-# wysyłanie pliku:
-curl -F "file=@nazwa_pliku" https://file.io
-#pobranie pliku:
-curl -o nazwa_pliku https://file.io/abc123
+# upload file
+curl -F "file=@data.txt" https://file.io
+# download file
+curl -o data.txt https://file.io/BrEqbnMSLuHw
 ```
-
-
