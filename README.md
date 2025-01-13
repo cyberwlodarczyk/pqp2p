@@ -22,10 +22,13 @@ openssl pkeyutl -verify -pubin -inkey sig-pubkey.pem -in data.txt -sigfile data.
 curl -F "file=@data.txt" https://file.io
 # download file
 curl -o data.txt https://file.io/BrEqbnMSLuHw
-```
+
 
 ```bash
+
+```
 ### komendy dla peera (alice - nadawca)
+
 # create private key and certificate signing request for the peer
 openssl req -new -newkey dilithium5 -keyout cert-pkey.pem -out csr.pem
 #przeslanie csr do CA
@@ -39,10 +42,10 @@ curl -F "file=@data.txt" https://file.io
 #odebranie klucza publicznego od boba
 curl -o data.txt https://file.io
 #przeslij plik
-pqp2p 127.0.0.1 cert.pem cert-pkey.pem ca-cert.pem sig-pkey.pem
+0.0.1 cert.pem cert-pkey.pem ca-cert.pem sig-pkey.pem
+```
 
-
-
+```
 ### dodatkowo dla odbiorcy:
 openssl pkeyutl -verify -pubin -inkey klucz-peera.pem -in plik.txt -sigfile plik.txt.sig
 ```
