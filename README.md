@@ -25,7 +25,7 @@ curl -o data.txt https://file.io/BrEqbnMSLuHw
 ```
 
 ```bash
-###komendy dla peera (alice - nadawca)
+### komendy dla peera (alice - nadawca)
 # create private key and certificate signing request for the peer
 openssl req -new -newkey dilithium5 -keyout cert-pkey.pem -out csr.pem
 #przeslanie csr do CA
