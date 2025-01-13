@@ -27,7 +27,7 @@ curl -o data.txt https://file.io/BrEqbnMSLuHw
 ```
 
 
-### komendy dla peera (alice - nadawca)
+### Komendy dla peera (alice - nadawca)
 
 ```bash
 # create private key and certificate signing request for the peer
@@ -46,7 +46,7 @@ curl -o data.txt https://file.io
 0.0.1 cert.pem cert-pkey.pem ca-cert.pem sig-pkey.pem
 ```
 
-### dodatkowo dla odbiorcy:
+### Dodatkowo dla odbiorcy:
 ```bash
 openssl pkeyutl -verify -pubin -inkey klucz-peera.pem -in plik.txt -sigfile plik.txt.sig
 ```
