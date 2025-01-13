@@ -24,11 +24,12 @@ curl -F "file=@data.txt" https://file.io
 curl -o data.txt https://file.io/BrEqbnMSLuHw
 
 
-```bash
-
 ```
+
+
 ### komendy dla peera (alice - nadawca)
 
+```bash
 # create private key and certificate signing request for the peer
 openssl req -new -newkey dilithium5 -keyout cert-pkey.pem -out csr.pem
 #przeslanie csr do CA
@@ -45,8 +46,8 @@ curl -o data.txt https://file.io
 0.0.1 cert.pem cert-pkey.pem ca-cert.pem sig-pkey.pem
 ```
 
-```
 ### dodatkowo dla odbiorcy:
+```bash
 openssl pkeyutl -verify -pubin -inkey klucz-peera.pem -in plik.txt -sigfile plik.txt.sig
 ```
 
