@@ -48,6 +48,9 @@ curl -o data.txt https://file.io
 
 ### Dodatkowo dla odbiorcy:
 ```bash
+#odbierz plik
+pqp2p 127.0.0.1 cert.pem cert-pkey.pem ca-cert.pem sig-pkey.pem
+#zweryfikuj poprawnosc pliku
 openssl pkeyutl -verify -pubin -inkey klucz-peera.pem -in plik.txt -sigfile plik.txt.sig
 ```
 
