@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <libgen.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <openssl/ssl.h>
@@ -259,7 +261,8 @@ int peer_tls_read(peer_t *p, void *buf, int n)
     int k = SSL_read(p->ssl, buf, n);
     if (k <= 0)
     {
-        if (SSL_get_error(p->ssl, k) == SSL_ERROR_ZERO_RETURN)
+        int ssl_error = SSL_get_error(p->ssl, k);
+        if (ssl_error == SSL_ERROR_ZERO_RETURN || ssl_error == /* ^C was clicked */ SSL_ERROR_SSL)
         {
             return 0;
         }
@@ -323,7 +326,6 @@ bool peer_tls_shutdown(peer_t *p)
     {
         return true;
     }
-    ERR_print_errors_fp(stderr);
     return false;
 }
 
@@ -524,23 +526,26 @@ char *peer_write_filename(peer_t *p)
         return NULL;
     }
     filename[strcspn(filename, "\n")] = '\0';
-    if (strchr(filename, '/') != NULL)
+    if(access(filename, F_OK) != 0) 
     {
-        printf("invalid filename\n");
-        free(filename);
+        fprintf(stderr, "No file with name %s\n", filename);
         return NULL;
     }
-    uint8_t filename_len = strlen(filename);
-    if (filename_len == QUIT_KEYWORD_LENGTH && strcmp(filename, QUIT_KEYWORD) == 0)
+    char * filename_copy = strdup(filename);
+    char *base_filename = basename(filename_copy);
+    uint8_t base_filename_len = strlen(base_filename);
+    if (filename[0] == '\0' || strcmp(filename, QUIT_KEYWORD) == 0)
     {
-        filename_len = 0;
         filename[0] = '\0';
+        base_filename_len = 0;
     }
-    if (peer_tls_write(p, &filename_len, 1) != 1 || (filename_len != 0 && peer_tls_write(p, filename, filename_len) != 1))
+    if (peer_tls_write(p, &base_filename_len, 1) != 1 || (base_filename_len != 0 && peer_tls_write(p, base_filename, base_filename_len) != 1))
     {
         free(filename);
+        free(filename_copy);
         return NULL;
     }
+    free(filename_copy);
     return filename;
 }
 
@@ -617,7 +622,7 @@ bool peer_write_sig(peer_t *p, uint8_t *file_content, size_t file_len)
 
 bool peer_write(peer_t *p)
 {
-    printf("enter file names to send\n");
+    printf("enter name of the file to be send\n");
     printf("type \"%s\" or an empty string to exit\n", QUIT_KEYWORD);
     while (true)
     {
