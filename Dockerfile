@@ -7,6 +7,8 @@ ARG LIBOQS_DIR=/opt/liboqs
 ARG CFLAGS="-I${OPENSSL_DIR}/include -I${LIBOQS_DIR}/include"
 ARG LDFLAGS="-L${OPENSSL_DIR}/lib -L${LIBOQS_DIR}/lib"
 ARG PQP2P_OUT=/bin/pqp2p
+ARG PQKEYPAIR_OUT=/bin/pqkeypair
+ARG PQVERIFY_OUT=/bin/pqverify
 
 FROM alpine:${ALPINE_VERSION} AS build
 ARG OPENSSL_DIR
@@ -15,6 +17,8 @@ ARG LIBOQS_DIR
 ARG CFLAGS
 ARG LDFLAGS
 ARG PQP2P_OUT
+ARG PQKEYPAIR_OUT
+ARG PQVERIFY_OUT
 RUN apk add --no-cache build-base linux-headers libtool automake autoconf cmake ninja make git
 WORKDIR /build
 RUN git clone --depth 1 --branch openssl-3.4.0 https://github.com/openssl/openssl.git
@@ -35,8 +39,10 @@ RUN cmake --build build
 RUN cmake --install build
 RUN cp build/lib/oqsprovider.so ${OPENSSL_MODULES}
 WORKDIR /build/pqp2p
-COPY main.c .
-RUN gcc ${CFLAGS} ${LDFLAGS} -o ${PQP2P_OUT} main.c -loqs -lcrypto -lssl
+COPY main.c keypair.c verify.c ./
+RUN gcc -Wall ${CFLAGS} ${LDFLAGS} -o ${PQP2P_OUT} main.c -loqs -lcrypto -lssl
+RUN gcc -Wall ${CFLAGS} ${LDFLAGS} -o ${PQKEYPAIR_OUT} keypair.c -loqs -lcrypto -lssl
+RUN gcc -Wall ${CFLAGS} ${LDFLAGS} -o ${PQVERIFY_OUT} verify.c -loqs -lcrypto -lssl
 
 FROM alpine:${ALPINE_VERSION} AS dev
 ARG OPENSSL_DIR
@@ -57,10 +63,14 @@ ENV PATH=${OPENSSL_PATH}:${PATH}
 
 FROM alpine:${ALPINE_VERSION} AS ca
 ARG OPENSSL_DIR
+ARG OPENSSL_MODULES
 ARG OPENSSL_PATH
 ARG OPENSSL_CONFIG
 COPY --from=build ${OPENSSL_DIR} ${OPENSSL_DIR}
 COPY openssl/ca.cnf ${OPENSSL_CONFIG}
+RUN apk add --no-cache curl
+ENV OPENSSL_DIR=${OPENSSL_DIR}
+ENV OPENSSL_MODULES=${OPENSSL_MODULES}
 ENV PATH=${OPENSSL_PATH}:${PATH}
 WORKDIR /home/ca
 RUN adduser -D -h /home/ca ca
@@ -73,12 +83,20 @@ CMD ["ash"]
 
 FROM alpine:${ALPINE_VERSION} AS peer
 ARG OPENSSL_DIR
+ARG OPENSSL_MODULES
 ARG OPENSSL_PATH
 ARG OPENSSL_CONFIG
 ARG PQP2P_OUT
+ARG PQKEYPAIR_OUT
+ARG PQVERIFY_OUT
 COPY --from=build ${OPENSSL_DIR} ${OPENSSL_DIR}
 COPY openssl/peer.cnf ${OPENSSL_CONFIG}
 COPY --from=build ${PQP2P_OUT} ${PQP2P_OUT}
+COPY --from=build ${PQKEYPAIR_OUT} ${PQKEYPAIR_OUT}
+COPY --from=build ${PQVERIFY_OUT} ${PQVERIFY_OUT}
+RUN apk add --no-cache curl
+ENV OPENSSL_DIR=${OPENSSL_DIR}
+ENV OPENSSL_MODULES=${OPENSSL_MODULES}
 ENV PATH=${OPENSSL_PATH}:${PATH}
 WORKDIR /home/peer
 RUN adduser -D -h /home/peer peer

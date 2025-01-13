@@ -15,17 +15,14 @@ openssl genpkey -algorithm dilithium5 -out sig-pkey.pem -outpubkey sig-pubkey.pe
 openssl pkeyutl -verify -pubin -inkey sig-pubkey.pem -in data.txt -sigfile data.txt.sig -provider oqsprovider -provider default
 ```
 
-### [file.io](https://www.file.io/)
+### [uguu.se](https://uguu.se/)
 
 ```bash
 # upload file
-curl -F "file=@data.txt" https://file.io
+curl -F files[]=@data.txt https://uguu.se/upload
 # download file
-curl -o data.txt https://file.io/BrEqbnMSLuHw
-
-
+curl -o data.txt https://d.uguu.se/OlATWQRq
 ```
-
 
 ### Komendy dla peera (alice - nadawca)
 
@@ -47,11 +44,10 @@ curl -o data.txt https://file.io
 ```
 
 ### Dodatkowo dla odbiorcy:
+
 ```bash
 #odbierz plik
 pqp2p 127.0.0.1 cert.pem cert-pkey.pem ca-cert.pem sig-pkey.pem
 #zweryfikuj poprawnosc pliku
 openssl pkeyutl -verify -pubin -inkey klucz-peera.pem -in plik.txt -sigfile plik.txt.sig
 ```
-
-
