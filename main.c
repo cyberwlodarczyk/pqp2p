@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
 #include <libgen.h>
@@ -22,6 +23,38 @@
 #define SIGNATURE_EXTENSION ".sig"
 #define SIGNATURE_EXTENSION_LENGTH (sizeof(SIGNATURE_EXTENSION) - 1)
 #define CMD_PREFIX_CHAR '\\'
+
+bool debug = false;
+
+void vflogf(FILE *file, const char *label, const char *color, const char *format, va_list args)
+{
+    fprintf(file, "\033[%sm", color);
+    fprintf(file, "[%s]", label);
+    fprintf(file, "\033[0m");
+    putc(' ', file);
+    vfprintf(file, format, args);
+    putc('\n', file);
+}
+
+void debugf(const char *format, ...)
+{
+    if (!debug)
+    {
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    vflogf(stdout, "debug", "90", format, args);
+    va_end(args);
+}
+
+void errorf(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vflogf(stderr, "error", "31", format, args);
+    va_end(args);
+}
 
 char *add_sig_ext(char *filename)
 {
@@ -122,7 +155,7 @@ cmd_t *cmd_parse(char *buf)
     if (c->type == -1)
     {
         free(c);
-        fprintf(stderr, "invalid command: %s\n", buf);
+        errorf("invalid command: %s", buf);
         return NULL;
     }
     size_t capacity = 4;
@@ -297,7 +330,7 @@ bool peer_tcp_accept(peer_t *p)
         close(server_fd);
         return false;
     }
-    printf("listening on 0.0.0.0:%d...\n", PORT);
+    debugf("listening on 0.0.0.0:%d...", PORT);
     struct sockaddr_in peer_addr;
     socklen_t peer_addr_len = sizeof(peer_addr);
     int peer_fd = accept(
@@ -313,10 +346,9 @@ bool peer_tcp_accept(peer_t *p)
     p->peer_fd = peer_fd;
     char peer_addr_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &peer_addr.sin_addr, peer_addr_str, INET_ADDRSTRLEN);
-    printf(
-        "connection received from %s:%d\n",
-        peer_addr_str,
-        ntohs(peer_addr.sin_port));
+    debugf("connection received from %s:%d",
+           peer_addr_str,
+           ntohs(peer_addr.sin_port));
     return true;
 }
 
@@ -336,17 +368,17 @@ bool peer_tcp_connect(peer_t *p)
     peer_addr.sin_port = htons(PORT);
     if (inet_pton(AF_INET, p->addr, &peer_addr.sin_addr) == 0)
     {
-        fprintf(stderr, "invalid peer address: %s\n", p->addr);
+        errorf("invalid peer address: %s", p->addr);
         close(peer_fd);
         return false;
     }
     if (connect(peer_fd, (struct sockaddr *)(&peer_addr), peer_addr_len) == -1)
     {
-        printf("could not connect to %s:%d\n", p->addr, PORT);
+        debugf("could not connect to %s:%d", p->addr, PORT);
         close(peer_fd);
         return false;
     }
-    printf("connected to %s:%d\n", p->addr, PORT);
+    debugf("connected to %s:%d", p->addr, PORT);
     return true;
 }
 
@@ -362,7 +394,7 @@ bool peer_tcp_close(peer_t *p)
 
 bool peer_tls_init(peer_t *p, const SSL_METHOD *meth, int mode, int (*handshake_fn)(SSL *ssl))
 {
-    printf("initializing tls...\n");
+    debugf("initializing tls...");
     SSL_CTX *ctx = SSL_CTX_new(meth);
     if (ctx == NULL)
     {
@@ -396,12 +428,12 @@ bool peer_tls_init(peer_t *p, const SSL_METHOD *meth, int mode, int (*handshake_
     {
         return false;
     }
-    printf("performing tls handshake...\n");
+    debugf("performing tls handshake...");
     if (handshake_fn(ssl) != 1)
     {
         return false;
     }
-    printf("connection is secure\n");
+    debugf("connection is secure");
     return true;
 }
 
@@ -928,9 +960,11 @@ bool peer_run(peer_t *p)
 
 int run(int argc, char **argv)
 {
+    char *debug_env = getenv("DEBUG");
+    debug = debug_env != NULL && strcmp(debug_env, "true") == 0;
     if (argc != 6)
     {
-        fprintf(stderr, "usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>\n", argv[0]);
+        errorf("usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>", argv[0]);
         return EXIT_FAILURE;
     }
     peer_t peer = {
