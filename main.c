@@ -21,9 +21,7 @@
 #define SIGNATURE_ALGORITHM OQS_SIG_alg_dilithium_5
 #define SIGNATURE_EXTENSION ".sig"
 #define SIGNATURE_EXTENSION_LENGTH (sizeof(SIGNATURE_EXTENSION) - 1)
-#define MAX_FILENAME_LENGTH 255
-#define QUIT_KEYWORD "quit"
-#define QUIT_KEYWORD_LENGTH (sizeof(QUIT_KEYWORD) - 1)
+#define CMD_PREFIX_CHAR '\\'
 
 char *add_sig_ext(char *filename)
 {
@@ -39,6 +37,140 @@ char *add_sig_ext(char *filename)
     result[len] = '\0';
     return result;
 }
+
+size_t get_file_len(FILE *file)
+{
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        perror("fseek");
+        return -1;
+    }
+    size_t len = ftell(file);
+    if (len == -1)
+    {
+        perror("ftell");
+        return -1;
+    }
+    if (fseek(file, 0, SEEK_SET) != 0)
+    {
+        perror("fseek");
+        return -1;
+    }
+    return len;
+}
+
+typedef enum
+{
+    CMD_TYPE_FILE,
+    CMD_TYPE_HELP,
+    CMD_TYPE_QUIT,
+} cmd_type_t;
+
+#define CMD_TYPE_FILE_STR "file"
+#define CMD_TYPE_HELP_STR "help"
+#define CMD_TYPE_QUIT_STR "quit"
+
+char *cmd_type_to_str(cmd_type_t type)
+{
+    switch (type)
+    {
+    case CMD_TYPE_FILE:
+        return CMD_TYPE_FILE_STR;
+    case CMD_TYPE_HELP:
+        return CMD_TYPE_HELP_STR;
+    case CMD_TYPE_QUIT:
+        return CMD_TYPE_QUIT_STR;
+    default:
+        return NULL;
+    }
+}
+
+cmd_type_t cmd_type_from_str(char *str)
+{
+    if (strcmp(str, CMD_TYPE_FILE_STR) == 0)
+    {
+        return CMD_TYPE_FILE;
+    }
+    if (strcmp(str, CMD_TYPE_HELP_STR) == 0)
+    {
+        return CMD_TYPE_HELP;
+    }
+    if (strcmp(str, CMD_TYPE_QUIT_STR) == 0)
+    {
+        return CMD_TYPE_QUIT;
+    }
+    return -1;
+}
+
+typedef struct
+{
+    cmd_type_t type;
+    int args_len;
+    char **args;
+} cmd_t;
+
+cmd_t *cmd_parse(char *buf)
+{
+    cmd_t *c = malloc(sizeof(cmd_t));
+    if (c == NULL)
+    {
+        perror("malloc");
+        return NULL;
+    }
+    char *type = strtok(buf, " ");
+    c->type = cmd_type_from_str(type);
+    if (c->type == -1)
+    {
+        free(c);
+        fprintf(stderr, "invalid command: %s\n", buf);
+        return NULL;
+    }
+    size_t capacity = 4;
+    c->args_len = 0;
+    c->args = malloc(capacity * sizeof(char *));
+    if (c->args == NULL)
+    {
+        perror("malloc");
+        free(c);
+        return NULL;
+    }
+    while (true)
+    {
+        char *arg = strtok(NULL, " ");
+        if (arg == NULL)
+        {
+            break;
+        }
+        c->args[c->args_len++] = arg;
+        if (c->args_len == capacity)
+        {
+            capacity *= 2;
+            char **args = realloc(c->args, capacity * sizeof(char *));
+            if (args == NULL)
+            {
+                perror("realloc");
+                free(c->args);
+                free(c);
+                return NULL;
+            }
+            c->args = args;
+        }
+    }
+    return c;
+}
+
+void cmd_free(cmd_t *c)
+{
+    free(c->args);
+    free(c);
+}
+
+typedef enum
+{
+    MESSAGE_TEXT,
+    MESSAGE_FILE,
+    MESSAGE_QUIT,
+} message_t;
 
 typedef struct
 {
@@ -98,6 +230,23 @@ bool peer_sig_init(peer_t *p)
     p->sig = sig;
     p->sig_pkey_buf = pkey_buf;
     return true;
+}
+
+uint8_t *peer_sig_sign(peer_t *p, uint8_t *msg, size_t msg_len)
+{
+    size_t sig_len = p->sig->length_signature;
+    uint8_t *sig = malloc(sig_len);
+    if (sig == NULL)
+    {
+        perror("malloc");
+        return NULL;
+    }
+    if (OQS_SIG_sign(p->sig, sig, &sig_len, msg, msg_len, p->sig_pkey_buf) != OQS_SUCCESS)
+    {
+        free(sig);
+        return NULL;
+    }
+    return sig;
 }
 
 void peer_sig_free(peer_t *p)
@@ -256,35 +405,24 @@ bool peer_tls_init(peer_t *p, const SSL_METHOD *meth, int mode, int (*handshake_
     return true;
 }
 
-int peer_tls_read(peer_t *p, void *buf, int n)
+bool peer_tls_read(peer_t *p, void *buf, int n)
 {
-    int k = SSL_read(p->ssl, buf, n);
-    if (k <= 0)
+    if (SSL_read(p->ssl, buf, n) <= 0)
     {
-        int ssl_error = SSL_get_error(p->ssl, k);
-        if (ssl_error == SSL_ERROR_ZERO_RETURN || ssl_error == /* ^C was clicked */ SSL_ERROR_SSL)
-        {
-            return 0;
-        }
         ERR_print_errors_fp(stderr);
-        return -1;
+        return false;
     }
-    return 1;
+    return true;
 }
 
-int peer_tls_write(peer_t *p, const void *buf, int n)
+bool peer_tls_write(peer_t *p, const void *buf, int n)
 {
-    int k = SSL_write(p->ssl, buf, n);
-    if (k <= 0)
+    if (SSL_write(p->ssl, buf, n) <= 0)
     {
-        if (SSL_get_error(p->ssl, k) == SSL_ERROR_ZERO_RETURN)
-        {
-            return 0;
-        }
         ERR_print_errors_fp(stderr);
-        return -1;
+        return false;
     }
-    return 1;
+    return true;
 }
 
 bool peer_tls_accept(peer_t *p)
@@ -347,100 +485,52 @@ bool peer_connect(peer_t *p)
     return peer_tcp_connect(p) && peer_tls_connect(p);
 }
 
-char *peer_read_filename(peer_t *p)
+bool peer_recv_byte(peer_t *p, uint8_t *b)
 {
-    uint8_t *filename_len = malloc(1);
-    if (filename_len == NULL)
-    {
-        perror("malloc");
-        return NULL;
-    }
-    if (peer_tls_read(p, filename_len, 1) != 1)
-    {
-        free(filename_len);
-        return NULL;
-    }
-    char *filename = malloc(*filename_len + 1);
-    if (filename == NULL)
-    {
-        perror("malloc");
-        free(filename_len);
-        return NULL;
-    }
-    if (*filename_len == 0)
-    {
-        filename[0] = '\0';
-        free(filename_len);
-        return filename;
-    }
-    if (peer_tls_read(p, filename, *filename_len) != 1)
-    {
-        free(filename);
-        free(filename_len);
-        return NULL;
-    }
-    filename[*filename_len] = '\0';
-    free(filename_len);
-    return filename;
+    return peer_tls_read(p, b, 1);
 }
 
-size_t peer_read_file_len(peer_t *p)
+bool peer_send_byte(peer_t *p, uint8_t b)
 {
-    const int n = sizeof(size_t);
-    uint8_t buf[n];
-    if (peer_tls_read(p, buf, n) != 1)
+    return peer_tls_write(p, &b, 1);
+}
+
+bool peer_recv_len(peer_t *p, size_t *len)
+{
+    uint8_t buf[8];
+    if (!peer_tls_read(p, buf, 8))
     {
-        return -1;
+        return false;
     }
+    memcpy(len, buf, 8);
+    return true;
+}
+
+bool peer_recv_text(peer_t *p)
+{
     size_t len;
-    memcpy(&len, buf, n);
-    return len;
-}
-
-bool peer_read_file(peer_t *p, char *filename)
-{
-    FILE *file = fopen(filename, "wb");
-    if (file == NULL)
+    if (!peer_recv_len(p, &len))
     {
-        perror(filename);
         return false;
     }
-    size_t file_len = peer_read_file_len(p);
-    if (file_len == -1)
+    char *text = malloc(len + 1);
+    if (text == NULL)
     {
-        fclose(file);
+        perror("malloc");
         return false;
     }
-    int n;
-    uint8_t buf[BUFFER_SIZE];
-    while (true)
+    if (!peer_tls_read(p, text, len))
     {
-        n = file_len < BUFFER_SIZE ? file_len : BUFFER_SIZE;
-        if (peer_tls_read(p, buf, n) != 1)
-        {
-            fclose(file);
-            return false;
-        }
-        if (fwrite(buf, 1, n, file) != n)
-        {
-            perror("fwrite");
-            fclose(file);
-            return false;
-        }
-        if (file_len <= BUFFER_SIZE)
-        {
-            if (fclose(file) != 0)
-            {
-                perror("fclose");
-                return false;
-            }
-            return true;
-        }
-        file_len -= BUFFER_SIZE;
+        free(text);
+        return false;
     }
+    text[len] = '\0';
+    printf("< %s\n", text);
+    free(text);
+    return true;
 }
 
-bool peer_read_sig(peer_t *p, char *filename)
+bool peer_recv_file_sig(peer_t *p, char *filename)
 {
     size_t sig_len = p->sig->length_signature;
     uint8_t *sig = malloc(sig_len);
@@ -449,7 +539,7 @@ bool peer_read_sig(peer_t *p, char *filename)
         perror("malloc");
         return false;
     }
-    if (peer_tls_read(p, sig, sig_len) != 1)
+    if (!peer_tls_read(p, sig, sig_len))
     {
         free(sig);
         return false;
@@ -484,134 +574,244 @@ bool peer_read_sig(peer_t *p, char *filename)
     return true;
 }
 
-bool peer_read(peer_t *p)
+bool peer_recv_file_content(peer_t *p, char *filename, size_t len)
 {
-    printf("waiting for files...\n");
+    FILE *file = fopen(filename, "wb");
+    if (file == NULL)
+    {
+        perror(filename);
+        return false;
+    }
+    size_t n;
+    uint8_t buf[BUFFER_SIZE];
     while (true)
     {
-        char *filename = peer_read_filename(p);
-        if (filename == NULL)
+        n = len < BUFFER_SIZE ? len : BUFFER_SIZE;
+        if (!peer_tls_read(p, buf, n))
         {
+            fclose(file);
             return false;
         }
-        if (filename[0] == '\0')
+        if (fwrite(buf, 1, n, file) != n)
         {
-            free(filename);
-            printf("done\n");
+            perror("fwrite");
+            fclose(file);
+            return false;
+        }
+        if (len <= BUFFER_SIZE)
+        {
+            if (fclose(file) != 0)
+            {
+                perror("fclose");
+                return false;
+            }
             return true;
         }
-        if (!peer_read_file(p, filename) || !peer_read_sig(p, filename))
-        {
-            free(filename);
-            return false;
-        }
-        printf("< %s\n", filename);
-        free(filename);
+        len -= BUFFER_SIZE;
     }
 }
 
-char *peer_write_filename(peer_t *p)
+bool peer_recv_file(peer_t *p)
 {
-    char *filename = malloc(MAX_FILENAME_LENGTH + 1);
+    size_t filename_len;
+    if (!peer_recv_len(p, &filename_len))
+    {
+        return false;
+    }
+    char *filename = malloc(filename_len + 1);
     if (filename == NULL)
     {
-        return NULL;
+        perror("malloc");
+        return false;
     }
-    printf("> ");
-    fflush(stdout);
-    if (fgets(filename, MAX_FILENAME_LENGTH + 1, stdin) == NULL)
-    {
-        perror("fgets");
-        free(filename);
-        return NULL;
-    }
-    filename[strcspn(filename, "\n")] = '\0';
-    if(access(filename, F_OK) != 0) 
-    {
-        fprintf(stderr, "No file with name %s\n", filename);
-        return NULL;
-    }
-    char * filename_copy = strdup(filename);
-    char *base_filename = basename(filename_copy);
-    uint8_t base_filename_len = strlen(base_filename);
-    if (filename[0] == '\0' || strcmp(filename, QUIT_KEYWORD) == 0)
-    {
-        filename[0] = '\0';
-        base_filename_len = 0;
-    }
-    if (peer_tls_write(p, &base_filename_len, 1) != 1 || (base_filename_len != 0 && peer_tls_write(p, base_filename, base_filename_len) != 1))
+    if (!peer_tls_read(p, filename, filename_len))
     {
         free(filename);
-        free(filename_copy);
-        return NULL;
+        return false;
     }
-    free(filename_copy);
-    return filename;
+    filename[filename_len] = '\0';
+    size_t file_len;
+    if (!peer_recv_len(p, &file_len))
+    {
+        free(filename);
+        return false;
+    }
+    bool download = false;
+    while (true)
+    {
+        printf("download \"%s\" (%ld bytes)? [Y/n] ", filename, file_len);
+        fflush(stdout);
+        char c = getchar();
+        if (c != '\n')
+        {
+            while (getchar() != '\n')
+            {
+            }
+        }
+        if (c == 'Y' || c == 'y' || c == '\n')
+        {
+            download = true;
+            break;
+        }
+        else if (c == 'N' || c == 'n')
+        {
+            break;
+        }
+    }
+    if (!peer_send_byte(p, download))
+    {
+        free(filename);
+        return false;
+    }
+    if (!download)
+    {
+        free(filename);
+        return true;
+    }
+    if (!peer_recv_file_content(p, filename, file_len) || !peer_recv_file_sig(p, filename))
+    {
+        free(filename);
+        return false;
+    }
+    free(filename);
+    return true;
 }
 
-size_t peer_write_file_len(peer_t *p, FILE *file)
+bool peer_recv_files(peer_t *p)
 {
-    const int n = sizeof(size_t);
-    if (fseek(file, 0, SEEK_END) != 0)
+    size_t len;
+    if (!peer_recv_len(p, &len))
     {
-        perror("fseek");
-        return -1;
+        return false;
     }
-    size_t len = ftell(file);
-    if (len == -1)
+    for (size_t i = 0; i < len; i++)
     {
-        perror("ftell");
-        return -1;
+        if (!peer_recv_file(p))
+        {
+            return false;
+        }
     }
-    if (fseek(file, 0, SEEK_SET) != 0)
-    {
-        perror("fseek");
-        return -1;
-    }
-    uint8_t buf[n];
-    memcpy(buf, &len, n);
-    if (peer_tls_write(p, buf, n) != 1)
-    {
-        return -1;
-    }
-    return len;
+    return true;
 }
 
-uint8_t *peer_write_file(peer_t *p, FILE *file, size_t file_len)
+bool peer_recv(peer_t *p)
 {
-    uint8_t *content = malloc(file_len);
-    if (content == NULL)
+    while (true)
     {
-        return NULL;
+        uint8_t b;
+        if (!peer_recv_byte(p, &b))
+        {
+            return false;
+        }
+        message_t mode = b;
+        if (mode == MESSAGE_TEXT)
+        {
+            if (!peer_recv_text(p))
+            {
+                return false;
+            }
+        }
+        else if (mode == MESSAGE_FILE)
+        {
+            if (!peer_recv_files(p))
+            {
+                return false;
+            }
+        }
+        else if (mode == MESSAGE_QUIT)
+        {
+            return true;
+        }
     }
-    if (fread(content, 1, file_len, file) != file_len)
+}
+
+bool peer_send_len(peer_t *p, size_t len)
+{
+    uint8_t buf[8];
+    memcpy(buf, &len, 8);
+    return peer_tls_write(p, buf, 8);
+}
+
+bool peer_send_text(peer_t *p, char *text)
+{
+    if (!peer_send_byte(p, MESSAGE_TEXT))
+    {
+        return false;
+    }
+    size_t len = strlen(text);
+    return peer_send_len(p, len) && peer_tls_write(p, text, len);
+}
+
+bool peer_send_file(peer_t *p, char *pathname)
+{
+    char *filename = basename(pathname);
+    size_t filename_len = strlen(filename);
+    if (!peer_send_len(p, filename_len) || !peer_tls_write(p, filename, filename_len))
+    {
+        return false;
+    }
+    FILE *file = fopen(pathname, "rb");
+    if (file == NULL)
+    {
+        perror(pathname);
+        return false;
+    }
+    size_t file_len = get_file_len(file);
+    if (file_len == -1)
+    {
+        fclose(file);
+        return false;
+    }
+    if (!peer_send_len(p, file_len))
+    {
+        fclose(file);
+        return false;
+    }
+    uint8_t b;
+    if (!peer_recv_byte(p, &b))
+    {
+        fclose(file);
+        return false;
+    }
+    bool ack = b;
+    if (!ack)
+    {
+        fclose(file);
+        return true;
+    }
+    uint8_t *file_content = malloc(file_len);
+    if (file_content == NULL)
+    {
+        perror("malloc");
+        fclose(file);
+        return false;
+    }
+    if (fread(file_content, 1, file_len, file) != file_len)
     {
         perror("fread");
-        free(content);
-        return NULL;
+        fclose(file);
+        free(file_content);
+        return false;
     }
-    if (peer_tls_write(p, content, file_len) != 1)
+    if (fclose(file) != 0)
     {
-        free(content);
-        return NULL;
+        perror("fclose");
+        free(file_content);
+        return false;
     }
-    return content;
-}
-
-bool peer_write_sig(peer_t *p, uint8_t *file_content, size_t file_len)
-{
-    size_t sig_len = p->sig->length_signature;
-    uint8_t *sig = malloc(sig_len);
+    if (!peer_tls_write(p, file_content, file_len))
+    {
+        free(file_content);
+        return false;
+    }
+    uint8_t *sig = peer_sig_sign(p, file_content, file_len);
     if (sig == NULL)
     {
+        free(file_content);
         return false;
     }
-    if (OQS_SIG_sign(p->sig, sig, &sig_len, file_content, file_len, p->sig_pkey_buf) != OQS_SUCCESS)
-    {
-        free(sig);
-        return false;
-    }
-    if (peer_tls_write(p, sig, sig_len) != 1)
+    free(file_content);
+    if (!peer_tls_write(p, sig, p->sig->length_signature))
     {
         free(sig);
         return false;
@@ -620,52 +820,62 @@ bool peer_write_sig(peer_t *p, uint8_t *file_content, size_t file_len)
     return true;
 }
 
-bool peer_write(peer_t *p)
+bool peer_send_files(peer_t *p, char **pathnames, size_t pathnames_len)
 {
-    printf("enter name of the file to be send\n");
-    printf("type \"%s\" or an empty string to exit\n", QUIT_KEYWORD);
+    if (!peer_send_byte(p, MESSAGE_FILE) || !peer_send_len(p, pathnames_len))
+    {
+        return false;
+    }
+    for (int i = 0; i < pathnames_len; i++)
+    {
+        if (!peer_send_file(p, pathnames[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool peer_send(peer_t *p)
+{
+    char buf[BUFFER_SIZE];
     while (true)
     {
-        char *filename = peer_write_filename(p);
-        if (filename == NULL)
+        printf("> ");
+        fflush(stdout);
+        if (fgets(buf, BUFFER_SIZE, stdin) == NULL)
         {
+            perror("fgets");
             return false;
         }
-        if (filename[0] == '\0')
+        buf[strcspn(buf, "\n")] = '\0';
+        if (buf[0] == CMD_PREFIX_CHAR)
         {
-            free(filename);
-            return true;
+            cmd_t *cmd = cmd_parse(buf + 1);
+            if (cmd == NULL)
+            {
+                continue;
+            }
+            switch (cmd->type)
+            {
+            case CMD_TYPE_FILE:
+                if (!peer_send_files(p, cmd->args, cmd->args_len))
+                {
+                    cmd_free(cmd);
+                    return false;
+                }
+                break;
+            case CMD_TYPE_HELP:
+                printf("TODO\n");
+                break;
+            case CMD_TYPE_QUIT:
+                cmd_free(cmd);
+                return peer_send_byte(p, MESSAGE_QUIT);
+            }
+            cmd_free(cmd);
         }
-        FILE *file = fopen(filename, "rb");
-        if (file == NULL)
+        else if (!peer_send_text(p, buf))
         {
-            perror(filename);
-            free(filename);
-            return false;
-        }
-        free(filename);
-        size_t file_len = peer_write_file_len(p, file);
-        if (file_len == -1)
-        {
-            fclose(file);
-            return false;
-        }
-        uint8_t *file_content = peer_write_file(p, file, file_len);
-        if (file_content == NULL)
-        {
-            fclose(file);
-            return false;
-        }
-        if (!peer_write_sig(p, file_content, file_len))
-        {
-            fclose(file);
-            free(file_content);
-            return false;
-        }
-        free(file_content);
-        if (fclose(file) != 0)
-        {
-            perror("fclose");
             return false;
         }
     }
@@ -689,7 +899,7 @@ bool peer_run(peer_t *p)
     }
     if (peer_connect(p))
     {
-        if (peer_read(p))
+        if (peer_recv(p))
         {
             if (peer_close(p))
             {
@@ -702,7 +912,7 @@ bool peer_run(peer_t *p)
     }
     if (peer_accept(p))
     {
-        if (peer_write(p))
+        if (peer_send(p))
         {
             if (peer_close(p))
             {
