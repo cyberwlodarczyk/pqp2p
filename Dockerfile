@@ -5,7 +5,7 @@ ARG OPENSSL_PATH=${OPENSSL_DIR}/bin
 ARG OPENSSL_CONFIG=${OPENSSL_DIR}/ssl/openssl.cnf
 ARG LIBOQS_DIR=/opt/liboqs
 ARG CFLAGS="-I${OPENSSL_DIR}/include -I${LIBOQS_DIR}/include"
-ARG LDFLAGS="-L${OPENSSL_DIR}/lib -L${LIBOQS_DIR}/lib"
+ARG LDFLAGS="-L${OPENSSL_DIR}/lib -L${LIBOQS_DIR}/lib -Wl,-rpath,${OPENSSL_DIR}/lib:${LIBOQS_DIR}/lib"
 ARG PQP2P_OUT=/bin/pqp2p
 ARG PQKEYPAIR_OUT=/bin/pqkeypair
 ARG PQVERIFY_OUT=/bin/pqverify
@@ -25,12 +25,12 @@ RUN git clone --depth 1 --branch openssl-3.4.0 https://github.com/openssl/openss
 RUN git clone --depth 1 --branch 0.12.0 https://github.com/open-quantum-safe/liboqs.git
 RUN git clone --depth 1 --branch 0.7.0 https://github.com/open-quantum-safe/oqs-provider.git
 WORKDIR /build/openssl
-RUN LDFLAGS="-Wl,-rpath -Wl,${OPENSSL_DIR}/lib64" ./config shared --prefix=${OPENSSL_DIR}
+RUN LDFLAGS="-Wl,-rpath,${OPENSSL_DIR}/lib64" ./config shared --prefix=${OPENSSL_DIR}
 RUN make
 RUN make install
 RUN ln -s ${OPENSSL_DIR}/lib64 ${OPENSSL_DIR}/lib
 WORKDIR /build/liboqs/build
-RUN cmake -G"Ninja" -DOQS_DIST_BUILD=ON -DOPENSSL_ROOT_DIR=${OPENSSL_DIR} -DCMAKE_INSTALL_PREFIX=${LIBOQS_DIR} ..
+RUN cmake -G"Ninja" -DBUILD_SHARED_LIBS=ON -DOPENSSL_ROOT_DIR=${OPENSSL_DIR} -DCMAKE_INSTALL_PREFIX=${LIBOQS_DIR} ..
 RUN ninja
 RUN ninja install
 WORKDIR /build/oqs-provider
