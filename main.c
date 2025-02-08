@@ -60,7 +60,7 @@ char *add_sig_ext(char *filename)
 {
     size_t filename_len = strlen(filename);
     size_t len = filename_len + SIGNATURE_EXTENSION_LENGTH;
-    char *result = malloc(len + 1);
+    char *result = OPENSSL_malloc(len + 1);
     if (result == NULL)
     {
         return NULL;
@@ -144,7 +144,7 @@ typedef struct
 
 cmd_t *cmd_parse(char *buf)
 {
-    cmd_t *c = malloc(sizeof(cmd_t));
+    cmd_t *c = OPENSSL_malloc(sizeof(cmd_t));
     if (c == NULL)
     {
         perror("malloc");
@@ -154,17 +154,17 @@ cmd_t *cmd_parse(char *buf)
     c->type = cmd_type_from_str(type);
     if (c->type == -1)
     {
-        free(c);
+        OPENSSL_clear_free(c, sizeof(cmd_t));
         errorf("invalid command: %s", buf);
         return NULL;
     }
     size_t capacity = 4;
     c->args_len = 0;
-    c->args = malloc(capacity * sizeof(char *));
+    c->args = OPENSSL_malloc(capacity * sizeof(char *));
     if (c->args == NULL)
     {
         perror("malloc");
-        free(c);
+        OPENSSL_clear_free(c, sizeof(cmd_t));
         return NULL;
     }
     while (true)
@@ -178,12 +178,12 @@ cmd_t *cmd_parse(char *buf)
         if (c->args_len == capacity)
         {
             capacity *= 2;
-            char **args = realloc(c->args, capacity * sizeof(char *));
+            char **args = OPENSSL_realloc(c->args, capacity * sizeof(char *));
             if (args == NULL)
             {
                 perror("realloc");
-                free(c->args);
-                free(c);
+                OPENSSL_free(c->args);
+                OPENSSL_clear_free(c, sizeof(cmd_t));
                 return NULL;
             }
             c->args = args;
@@ -194,8 +194,8 @@ cmd_t *cmd_parse(char *buf)
 
 void cmd_free(cmd_t *c)
 {
-    free(c->args);
-    free(c);
+    OPENSSL_free(c->args);
+    OPENSSL_clear_free(c, sizeof(cmd_t));
 }
 
 typedef enum
@@ -243,7 +243,7 @@ bool peer_sig_init(peer_t *p)
     }
     OQS_SIG *sig = OQS_SIG_new(SIGNATURE_ALGORITHM);
     size_t pkey_len = sig->length_secret_key;
-    uint8_t *pkey_buf = malloc(pkey_len);
+    uint8_t *pkey_buf = OPENSSL_malloc(pkey_len);
     if (pkey_buf == NULL)
     {
         perror("malloc");
@@ -254,7 +254,7 @@ bool peer_sig_init(peer_t *p)
     if (EVP_PKEY_get_raw_private_key(pkey_evp, pkey_buf, &pkey_len) != 1)
     {
         ERR_print_errors_fp(stderr);
-        free(pkey_buf);
+        OPENSSL_clear_free(pkey_buf, pkey_len);
         OQS_SIG_free(sig);
         EVP_PKEY_free(pkey_evp);
         return false;
@@ -268,7 +268,7 @@ bool peer_sig_init(peer_t *p)
 uint8_t *peer_sig_sign(peer_t *p, uint8_t *msg, size_t msg_len)
 {
     size_t sig_len = p->sig->length_signature;
-    uint8_t *sig = malloc(sig_len);
+    uint8_t *sig = OPENSSL_malloc(sig_len);
     if (sig == NULL)
     {
         perror("malloc");
@@ -276,7 +276,7 @@ uint8_t *peer_sig_sign(peer_t *p, uint8_t *msg, size_t msg_len)
     }
     if (OQS_SIG_sign(p->sig, sig, &sig_len, msg, msg_len, p->sig_pkey_buf) != OQS_SUCCESS)
     {
-        free(sig);
+        OPENSSL_clear_free(sig, sig_len);
         return NULL;
     }
     return sig;
@@ -284,7 +284,7 @@ uint8_t *peer_sig_sign(peer_t *p, uint8_t *msg, size_t msg_len)
 
 void peer_sig_free(peer_t *p)
 {
-    free(p->sig_pkey_buf);
+    OPENSSL_clear_free(p->sig_pkey_buf, p->sig->length_secret_key);
     OQS_SIG_free(p->sig);
 }
 
@@ -401,6 +401,14 @@ bool peer_tls_init(peer_t *p, const SSL_METHOD *meth, int mode, int (*handshake_
         return false;
     }
     p->ctx = ctx;
+    if (SSL_CTX_set1_groups_list(ctx, "kyber1024") != 1)
+    {
+        return false;
+    }
+    if (SSL_CTX_set1_sigalgs_list(ctx, "dilithium5") != 1)
+    {
+        return false;
+    }
     if (SSL_CTX_use_certificate_file(ctx, p->cert, SSL_FILETYPE_PEM) != 1)
     {
         return false;
@@ -545,7 +553,7 @@ bool peer_recv_text(peer_t *p)
     {
         return false;
     }
-    char *text = malloc(len + 1);
+    char *text = OPENSSL_malloc(len + 1);
     if (text == NULL)
     {
         perror("malloc");
@@ -553,19 +561,19 @@ bool peer_recv_text(peer_t *p)
     }
     if (!peer_tls_read(p, text, len))
     {
-        free(text);
+        OPENSSL_clear_free(text, len);
         return false;
     }
     text[len] = '\0';
     printf("< %s\n", text);
-    free(text);
+    OPENSSL_clear_free(text, len);
     return true;
 }
 
 bool peer_recv_file_sig(peer_t *p, char *filename)
 {
     size_t sig_len = p->sig->length_signature;
-    uint8_t *sig = malloc(sig_len);
+    uint8_t *sig = OPENSSL_malloc(sig_len);
     if (sig == NULL)
     {
         perror("malloc");
@@ -573,31 +581,31 @@ bool peer_recv_file_sig(peer_t *p, char *filename)
     }
     if (!peer_tls_read(p, sig, sig_len))
     {
-        free(sig);
+        OPENSSL_clear_free(sig, sig_len);
         return false;
     }
     char *sig_filename = add_sig_ext(filename);
     if (sig_filename == NULL)
     {
-        free(sig);
+        OPENSSL_clear_free(sig, sig_len);
         return false;
     }
     FILE *sig_file = fopen(sig_filename, "wb");
     if (sig_file == NULL)
     {
-        free(sig_filename);
-        free(sig);
+        OPENSSL_clear_free(sig_filename, strlen(sig_filename) + 1);
+        OPENSSL_clear_free(sig, sig_len);
         return false;
     }
-    free(sig_filename);
+    OPENSSL_clear_free(sig_filename, strlen(sig_filename) + 1);
     if (fwrite(sig, 1, sig_len, sig_file) != sig_len)
     {
         perror("fwrite");
         fclose(sig_file);
-        free(sig);
+        OPENSSL_clear_free(sig, sig_len);
         return false;
     }
-    free(sig);
+    OPENSSL_clear_free(sig, sig_len);
     if (fclose(sig_file) != 0)
     {
         perror("fclose");
@@ -650,7 +658,7 @@ bool peer_recv_file(peer_t *p)
     {
         return false;
     }
-    char *filename = malloc(filename_len + 1);
+    char *filename = OPENSSL_malloc(filename_len + 1);
     if (filename == NULL)
     {
         perror("malloc");
@@ -658,14 +666,14 @@ bool peer_recv_file(peer_t *p)
     }
     if (!peer_tls_read(p, filename, filename_len))
     {
-        free(filename);
+        OPENSSL_clear_free(filename, filename_len + 1);
         return false;
     }
     filename[filename_len] = '\0';
     size_t file_len;
     if (!peer_recv_len(p, &file_len))
     {
-        free(filename);
+        OPENSSL_clear_free(filename, filename_len + 1);
         return false;
     }
     bool download = false;
@@ -692,20 +700,20 @@ bool peer_recv_file(peer_t *p)
     }
     if (!peer_send_byte(p, download))
     {
-        free(filename);
+        OPENSSL_clear_free(filename, filename_len + 1);
         return false;
     }
     if (!download)
     {
-        free(filename);
+        OPENSSL_clear_free(filename, filename_len + 1);
         return true;
     }
     if (!peer_recv_file_content(p, filename, file_len) || !peer_recv_file_sig(p, filename))
     {
-        free(filename);
+        OPENSSL_clear_free(filename, filename_len + 1);
         return false;
     }
-    free(filename);
+    OPENSSL_clear_free(filename, filename_len + 1);
     return true;
 }
 
@@ -811,7 +819,7 @@ bool peer_send_file(peer_t *p, char *pathname)
         fclose(file);
         return true;
     }
-    uint8_t *file_content = malloc(file_len);
+    uint8_t *file_content = OPENSSL_malloc(file_len);
     if (file_content == NULL)
     {
         perror("malloc");
@@ -822,33 +830,33 @@ bool peer_send_file(peer_t *p, char *pathname)
     {
         perror("fread");
         fclose(file);
-        free(file_content);
+        OPENSSL_clear_free(file_content, file_len);
         return false;
     }
     if (fclose(file) != 0)
     {
         perror("fclose");
-        free(file_content);
+        OPENSSL_clear_free(file_content, file_len);
         return false;
     }
     if (!peer_tls_write(p, file_content, file_len))
     {
-        free(file_content);
+        OPENSSL_clear_free(file_content, file_len);
         return false;
     }
     uint8_t *sig = peer_sig_sign(p, file_content, file_len);
     if (sig == NULL)
     {
-        free(file_content);
+        OPENSSL_clear_free(file_content, file_len);
         return false;
     }
-    free(file_content);
+    OPENSSL_clear_free(file_content, file_len);
     if (!peer_tls_write(p, sig, p->sig->length_signature))
     {
-        free(sig);
+        OPENSSL_clear_free(sig, p->sig->length_signature);
         return false;
     }
-    free(sig);
+    OPENSSL_clear_free(sig, p->sig->length_signature);
     return true;
 }
 
@@ -958,10 +966,8 @@ bool peer_run(peer_t *p)
     return false;
 }
 
-int run(int argc, char **argv)
+int run_peer(int argc, char **argv)
 {
-    char *debug_env = getenv("DEBUG");
-    debug = debug_env != NULL && strcmp(debug_env, "true") == 0;
     if (argc != 6)
     {
         errorf("usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>", argv[0]);
@@ -980,6 +986,11 @@ int run(int argc, char **argv)
         .ctx = NULL,
         .ssl = NULL,
     };
+    return peer_run(&peer) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int run_with_oqs_provider(int argc, char **argv)
+{
     OSSL_PROVIDER *default_prov = OSSL_PROVIDER_load(NULL, "default");
     if (default_prov == NULL)
     {
@@ -992,7 +1003,8 @@ int run(int argc, char **argv)
         ERR_print_errors_fp(stderr);
         return EXIT_FAILURE;
     }
-    if (!peer_run(&peer))
+    int code = run_peer(argc, argv);
+    if (code == EXIT_FAILURE)
     {
         OSSL_PROVIDER_unload(default_prov);
         OSSL_PROVIDER_unload(oqs_prov);
@@ -1011,9 +1023,25 @@ int run(int argc, char **argv)
     return EXIT_SUCCESS;
 }
 
+int run_with_oqs(int argc, char **argv)
+{
+    debugf("using oqs version %s", OQS_version());
+    OQS_init();
+    int code = run_with_oqs_provider(argc, argv);
+    OQS_destroy();
+    return code;
+}
+
+int run(int argc, char **argv)
+{
+    char *debug_env = getenv("DEBUG");
+    debug = debug_env != NULL && strcmp(debug_env, "true") == 0;
+    int code = run_with_oqs(argc, argv);
+    debugf("exit status %d", code);
+    return code;
+}
+
 int main(int argc, char **argv)
 {
-    int code = run(argc, argv);
-    printf("exit status %d\n", code);
-    return code;
+    return run(argc, argv);
 }
