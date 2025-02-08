@@ -154,7 +154,7 @@ cmd_t *cmd_parse(char *buf)
     c->type = cmd_type_from_str(type);
     if (c->type == -1)
     {
-        OPENSSL_clear_free(c, sizeof(cmd_t));
+        OPENSSL_free(c);
         errorf("invalid command: %s", buf);
         return NULL;
     }
@@ -164,7 +164,7 @@ cmd_t *cmd_parse(char *buf)
     if (c->args == NULL)
     {
         perror("malloc");
-        OPENSSL_clear_free(c, sizeof(cmd_t));
+        OPENSSL_free(c);
         return NULL;
     }
     while (true)
@@ -183,7 +183,7 @@ cmd_t *cmd_parse(char *buf)
             {
                 perror("realloc");
                 OPENSSL_free(c->args);
-                OPENSSL_clear_free(c, sizeof(cmd_t));
+                OPENSSL_free(c);
                 return NULL;
             }
             c->args = args;
@@ -195,7 +195,7 @@ cmd_t *cmd_parse(char *buf)
 void cmd_free(cmd_t *c)
 {
     OPENSSL_free(c->args);
-    OPENSSL_clear_free(c, sizeof(cmd_t));
+    OPENSSL_free(c);
 }
 
 typedef enum
@@ -276,7 +276,7 @@ uint8_t *peer_sig_sign(peer_t *p, uint8_t *msg, size_t msg_len)
     }
     if (OQS_SIG_sign(p->sig, sig, &sig_len, msg, msg_len, p->sig_pkey_buf) != OQS_SUCCESS)
     {
-        OPENSSL_clear_free(sig, sig_len);
+        OPENSSL_free(sig);
         return NULL;
     }
     return sig;
@@ -561,12 +561,12 @@ bool peer_recv_text(peer_t *p)
     }
     if (!peer_tls_read(p, text, len))
     {
-        OPENSSL_clear_free(text, len);
+        OPENSSL_free(text);
         return false;
     }
     text[len] = '\0';
     printf("< %s\n", text);
-    OPENSSL_clear_free(text, len);
+    OPENSSL_free(text);
     return true;
 }
 
@@ -581,31 +581,31 @@ bool peer_recv_file_sig(peer_t *p, char *filename)
     }
     if (!peer_tls_read(p, sig, sig_len))
     {
-        OPENSSL_clear_free(sig, sig_len);
+        OPENSSL_free(sig);
         return false;
     }
     char *sig_filename = add_sig_ext(filename);
     if (sig_filename == NULL)
     {
-        OPENSSL_clear_free(sig, sig_len);
+        OPENSSL_free(sig);
         return false;
     }
     FILE *sig_file = fopen(sig_filename, "wb");
     if (sig_file == NULL)
     {
-        OPENSSL_clear_free(sig_filename, strlen(sig_filename) + 1);
-        OPENSSL_clear_free(sig, sig_len);
+        OPENSSL_free(sig_filename);
+        OPENSSL_free(sig);
         return false;
     }
-    OPENSSL_clear_free(sig_filename, strlen(sig_filename) + 1);
+    OPENSSL_free(sig_filename);
     if (fwrite(sig, 1, sig_len, sig_file) != sig_len)
     {
         perror("fwrite");
         fclose(sig_file);
-        OPENSSL_clear_free(sig, sig_len);
+        OPENSSL_free(sig);
         return false;
     }
-    OPENSSL_clear_free(sig, sig_len);
+    OPENSSL_free(sig);
     if (fclose(sig_file) != 0)
     {
         perror("fclose");
@@ -666,14 +666,14 @@ bool peer_recv_file(peer_t *p)
     }
     if (!peer_tls_read(p, filename, filename_len))
     {
-        OPENSSL_clear_free(filename, filename_len + 1);
+        OPENSSL_free(filename);
         return false;
     }
     filename[filename_len] = '\0';
     size_t file_len;
     if (!peer_recv_len(p, &file_len))
     {
-        OPENSSL_clear_free(filename, filename_len + 1);
+        OPENSSL_free(filename);
         return false;
     }
     bool download = false;
@@ -700,20 +700,20 @@ bool peer_recv_file(peer_t *p)
     }
     if (!peer_send_byte(p, download))
     {
-        OPENSSL_clear_free(filename, filename_len + 1);
+        OPENSSL_free(filename);
         return false;
     }
     if (!download)
     {
-        OPENSSL_clear_free(filename, filename_len + 1);
+        OPENSSL_free(filename);
         return true;
     }
     if (!peer_recv_file_content(p, filename, file_len) || !peer_recv_file_sig(p, filename))
     {
-        OPENSSL_clear_free(filename, filename_len + 1);
+        OPENSSL_free(filename);
         return false;
     }
-    OPENSSL_clear_free(filename, filename_len + 1);
+    OPENSSL_free(filename);
     return true;
 }
 
@@ -830,33 +830,33 @@ bool peer_send_file(peer_t *p, char *pathname)
     {
         perror("fread");
         fclose(file);
-        OPENSSL_clear_free(file_content, file_len);
+        OPENSSL_free(file_content);
         return false;
     }
     if (fclose(file) != 0)
     {
         perror("fclose");
-        OPENSSL_clear_free(file_content, file_len);
+        OPENSSL_free(file_content);
         return false;
     }
     if (!peer_tls_write(p, file_content, file_len))
     {
-        OPENSSL_clear_free(file_content, file_len);
+        OPENSSL_free(file_content);
         return false;
     }
     uint8_t *sig = peer_sig_sign(p, file_content, file_len);
     if (sig == NULL)
     {
-        OPENSSL_clear_free(file_content, file_len);
+        OPENSSL_free(file_content);
         return false;
     }
-    OPENSSL_clear_free(file_content, file_len);
+    OPENSSL_free(file_content);
     if (!peer_tls_write(p, sig, p->sig->length_signature))
     {
-        OPENSSL_clear_free(sig, p->sig->length_signature);
+        OPENSSL_free(sig);
         return false;
     }
-    OPENSSL_clear_free(sig, p->sig->length_signature);
+    OPENSSL_free(sig);
     return true;
 }
 
