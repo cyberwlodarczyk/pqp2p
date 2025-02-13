@@ -71,14 +71,14 @@ char *add_sig_ext(char *filename)
     return result;
 }
 
-size_t get_file_len(FILE *file)
+uint64_t get_file_size(FILE *file)
 {
     if (fseek(file, 0, SEEK_END) != 0)
     {
         perror("fseek");
         return -1;
     }
-    size_t len = ftell(file);
+    uint64_t len = ftell(file);
     if (len == -1)
     {
         perror("ftell");
@@ -94,35 +94,26 @@ size_t get_file_len(FILE *file)
 
 typedef enum
 {
-    CMD_TYPE_FILE,
+    CMD_TYPE_UPLOAD,
+    CMD_TYPE_DOWNLOAD,
     CMD_TYPE_HELP,
     CMD_TYPE_QUIT,
 } cmd_type_t;
 
-#define CMD_TYPE_FILE_STR "file"
+#define CMD_TYPE_UPLOAD_STR "upload"
+#define CMD_TYPE_DOWNLOAD_STR "download"
 #define CMD_TYPE_HELP_STR "help"
 #define CMD_TYPE_QUIT_STR "quit"
 
-char *cmd_type_to_str(cmd_type_t type)
-{
-    switch (type)
-    {
-    case CMD_TYPE_FILE:
-        return CMD_TYPE_FILE_STR;
-    case CMD_TYPE_HELP:
-        return CMD_TYPE_HELP_STR;
-    case CMD_TYPE_QUIT:
-        return CMD_TYPE_QUIT_STR;
-    default:
-        return NULL;
-    }
-}
-
 cmd_type_t cmd_type_from_str(char *str)
 {
-    if (strcmp(str, CMD_TYPE_FILE_STR) == 0)
+    if (strcmp(str, CMD_TYPE_UPLOAD_STR) == 0)
     {
-        return CMD_TYPE_FILE;
+        return CMD_TYPE_UPLOAD;
+    }
+    if (strcmp(str, CMD_TYPE_DOWNLOAD_STR) == 0)
+    {
+        return CMD_TYPE_DOWNLOAD;
     }
     if (strcmp(str, CMD_TYPE_HELP_STR) == 0)
     {
@@ -201,9 +192,81 @@ void cmd_free(cmd_t *c)
 typedef enum
 {
     MESSAGE_TEXT,
-    MESSAGE_FILE,
+    MESSAGE_UPLOAD,
+    MESSAGE_DOWNLOAD,
     MESSAGE_QUIT,
 } message_t;
+
+#define FILE_STORE_SIZE 16
+
+typedef struct
+{
+    uint8_t id;
+    char *pathname;
+} file_store_item_t;
+
+typedef struct
+{
+    file_store_item_t items[FILE_STORE_SIZE];
+    size_t size;
+} file_store_t;
+
+file_store_t *file_store_new()
+{
+    file_store_t *fs = OPENSSL_malloc(sizeof(file_store_t));
+    if (fs == NULL)
+    {
+        return NULL;
+    }
+    fs->size = 0;
+    return fs;
+}
+
+bool file_store_add(file_store_t *fs, uint8_t id, char *pathname)
+{
+    if (fs->size == FILE_STORE_SIZE)
+    {
+        return false;
+    }
+    file_store_item_t item = {.id = id, .pathname = pathname};
+    fs->items[fs->size++] = item;
+    return true;
+}
+
+char *file_store_get(file_store_t *fs, uint8_t id)
+{
+    for (size_t i = 0; i < fs->size; i++)
+    {
+        if (fs->items[i].id == id)
+        {
+            return fs->items[i].pathname;
+        }
+    }
+    return NULL;
+}
+
+bool file_store_remove(file_store_t *fs, uint8_t id)
+{
+    for (size_t i = 0; i < fs->size; i++)
+    {
+        if (fs->items[i].id != id)
+        {
+            continue;
+        }
+        if (i != fs->size - 1)
+        {
+            memcpy(&fs->items[i], &fs->items[fs->size - 1], sizeof(file_store_item_t));
+        }
+        fs->size--;
+        return true;
+    }
+    return false;
+}
+
+void file_store_free(file_store_t *s)
+{
+    OPENSSL_free(s);
+}
 
 typedef struct
 {
@@ -214,6 +277,9 @@ typedef struct
     char *sig_pkey;
     int peer_fd;
     int server_fd;
+    uint8_t upload_next_id;
+    file_store_t *upload_store;
+    file_store_t *download_store;
     OQS_SIG *sig;
     uint8_t *sig_pkey_buf;
     SSL_CTX *ctx;
@@ -525,31 +591,129 @@ bool peer_connect(peer_t *p)
     return peer_tcp_connect(p) && peer_tls_connect(p);
 }
 
-bool peer_recv_byte(peer_t *p, uint8_t *b)
+bool peer_read_uint8(peer_t *p, uint8_t *n)
 {
-    return peer_tls_read(p, b, 1);
+    return peer_tls_read(p, n, 1);
 }
 
-bool peer_send_byte(peer_t *p, uint8_t b)
+bool peer_read_uint16(peer_t *p, uint16_t *n)
 {
-    return peer_tls_write(p, &b, 1);
+    return peer_tls_read(p, n, 2);
 }
 
-bool peer_recv_len(peer_t *p, size_t *len)
+bool peer_read_uint64(peer_t *p, uint64_t *n)
 {
-    uint8_t buf[8];
-    if (!peer_tls_read(p, buf, 8))
+    return peer_tls_read(p, n, 8);
+}
+
+bool peer_read_file_content(peer_t *p, char *filename, uint64_t size)
+{
+    FILE *file = fopen(filename, "wb");
+    if (file == NULL)
     {
+        perror(filename);
         return false;
     }
-    memcpy(len, buf, 8);
+    uint64_t n;
+    uint8_t buf[BUFFER_SIZE];
+    while (true)
+    {
+        n = size < BUFFER_SIZE ? size : BUFFER_SIZE;
+        if (!peer_tls_read(p, buf, n))
+        {
+            fclose(file);
+            return false;
+        }
+        if (fwrite(buf, 1, n, file) != n)
+        {
+            perror("fwrite");
+            fclose(file);
+            return false;
+        }
+        if (size <= BUFFER_SIZE)
+        {
+            if (fclose(file) != 0)
+            {
+                perror("fclose");
+                return false;
+            }
+            return true;
+        }
+        size -= BUFFER_SIZE;
+    }
+}
+
+bool peer_read_file_sig(peer_t *p, char *filename)
+{
+    size_t len = p->sig->length_signature;
+    uint8_t *sig = OPENSSL_malloc(len);
+    if (sig == NULL)
+    {
+        perror("malloc");
+        return false;
+    }
+    if (!peer_tls_read(p, sig, len))
+    {
+        OPENSSL_free(sig);
+        return false;
+    }
+    filename = add_sig_ext(filename);
+    if (filename == NULL)
+    {
+        OPENSSL_free(sig);
+        return false;
+    }
+    FILE *file = fopen(filename, "wb");
+    if (file == NULL)
+    {
+        OPENSSL_free(filename);
+        OPENSSL_free(sig);
+        return false;
+    }
+    OPENSSL_free(filename);
+    if (fwrite(sig, 1, len, file) != len)
+    {
+        perror("fwrite");
+        fclose(file);
+        OPENSSL_free(sig);
+        return false;
+    }
+    OPENSSL_free(sig);
+    if (fclose(file) != 0)
+    {
+        perror("fclose");
+        return false;
+    }
     return true;
 }
 
-bool peer_recv_text(peer_t *p)
+bool peer_read_file(peer_t *p, char *filename)
 {
-    size_t len;
-    if (!peer_recv_len(p, &len))
+    uint64_t size;
+    return peer_read_uint64(p, &size) &&
+           peer_read_file_content(p, filename, size) &&
+           peer_read_file_sig(p, filename);
+}
+
+bool peer_write_uint8(peer_t *p, uint8_t n)
+{
+    return peer_tls_write(p, &n, 1);
+}
+
+bool peer_write_uint16(peer_t *p, uint16_t n)
+{
+    return peer_tls_write(p, &n, 2);
+}
+
+bool peer_write_uint64(peer_t *p, uint64_t n)
+{
+    return peer_tls_write(p, &n, 8);
+}
+
+bool peer_rx_text(peer_t *p)
+{
+    uint16_t len;
+    if (!peer_read_uint16(p, &len))
     {
         return false;
     }
@@ -570,163 +734,45 @@ bool peer_recv_text(peer_t *p)
     return true;
 }
 
-bool peer_recv_file_sig(peer_t *p, char *filename)
+bool peer_rx_upload_filename(peer_t *p)
 {
-    size_t sig_len = p->sig->length_signature;
-    uint8_t *sig = OPENSSL_malloc(sig_len);
-    if (sig == NULL)
-    {
-        perror("malloc");
-        return false;
-    }
-    if (!peer_tls_read(p, sig, sig_len))
-    {
-        OPENSSL_free(sig);
-        return false;
-    }
-    char *sig_filename = add_sig_ext(filename);
-    if (sig_filename == NULL)
-    {
-        OPENSSL_free(sig);
-        return false;
-    }
-    FILE *sig_file = fopen(sig_filename, "wb");
-    if (sig_file == NULL)
-    {
-        OPENSSL_free(sig_filename);
-        OPENSSL_free(sig);
-        return false;
-    }
-    OPENSSL_free(sig_filename);
-    if (fwrite(sig, 1, sig_len, sig_file) != sig_len)
-    {
-        perror("fwrite");
-        fclose(sig_file);
-        OPENSSL_free(sig);
-        return false;
-    }
-    OPENSSL_free(sig);
-    if (fclose(sig_file) != 0)
-    {
-        perror("fclose");
-        return false;
-    }
-    return true;
-}
-
-bool peer_recv_file_content(peer_t *p, char *filename, size_t len)
-{
-    FILE *file = fopen(filename, "wb");
-    if (file == NULL)
-    {
-        perror(filename);
-        return false;
-    }
-    size_t n;
-    uint8_t buf[BUFFER_SIZE];
-    while (true)
-    {
-        n = len < BUFFER_SIZE ? len : BUFFER_SIZE;
-        if (!peer_tls_read(p, buf, n))
-        {
-            fclose(file);
-            return false;
-        }
-        if (fwrite(buf, 1, n, file) != n)
-        {
-            perror("fwrite");
-            fclose(file);
-            return false;
-        }
-        if (len <= BUFFER_SIZE)
-        {
-            if (fclose(file) != 0)
-            {
-                perror("fclose");
-                return false;
-            }
-            return true;
-        }
-        len -= BUFFER_SIZE;
-    }
-}
-
-bool peer_recv_file(peer_t *p)
-{
-    size_t filename_len;
-    if (!peer_recv_len(p, &filename_len))
+    uint8_t id;
+    if (!peer_read_uint8(p, &id))
     {
         return false;
     }
-    char *filename = OPENSSL_malloc(filename_len + 1);
+    uint8_t len;
+    if (!peer_read_uint8(p, &len))
+    {
+        return false;
+    }
+    char *filename = OPENSSL_malloc(len + 1);
     if (filename == NULL)
     {
         perror("malloc");
         return false;
     }
-    if (!peer_tls_read(p, filename, filename_len))
+    if (!peer_tls_read(p, filename, len))
     {
         OPENSSL_free(filename);
         return false;
     }
-    filename[filename_len] = '\0';
-    size_t file_len;
-    if (!peer_recv_len(p, &file_len))
-    {
-        OPENSSL_free(filename);
-        return false;
-    }
-    bool download = false;
-    while (true)
-    {
-        printf("download \"%s\" (%ld bytes)? [Y/n] ", filename, file_len);
-        fflush(stdout);
-        char c = getchar();
-        if (c != '\n')
-        {
-            while (getchar() != '\n')
-            {
-            }
-        }
-        if (c == 'Y' || c == 'y' || c == '\n')
-        {
-            download = true;
-            break;
-        }
-        else if (c == 'N' || c == 'n')
-        {
-            break;
-        }
-    }
-    if (!peer_send_byte(p, download))
-    {
-        OPENSSL_free(filename);
-        return false;
-    }
-    if (!download)
-    {
-        OPENSSL_free(filename);
-        return true;
-    }
-    if (!peer_recv_file_content(p, filename, file_len) || !peer_recv_file_sig(p, filename))
-    {
-        OPENSSL_free(filename);
-        return false;
-    }
-    OPENSSL_free(filename);
+    filename[len] = '\0';
+    file_store_add(p->download_store, id, filename);
+    printf("# %s (%d)\n", filename, id);
     return true;
 }
 
-bool peer_recv_files(peer_t *p)
+bool peer_rx_upload(peer_t *p)
 {
-    size_t len;
-    if (!peer_recv_len(p, &len))
+    uint8_t count;
+    if (!peer_read_uint8(p, &count))
     {
         return false;
     }
-    for (size_t i = 0; i < len; i++)
+    for (uint8_t i = 0; i < count; i++)
     {
-        if (!peer_recv_file(p))
+        if (!peer_rx_upload_filename(p))
         {
             return false;
         }
@@ -734,26 +780,121 @@ bool peer_recv_files(peer_t *p)
     return true;
 }
 
-bool peer_recv(peer_t *p)
+bool peer_rx_download_file(peer_t *p)
+{
+    uint8_t id;
+    if (!peer_read_uint8(p, &id))
+    {
+        return false;
+    }
+    char *pathname = file_store_get(p->upload_store, id);
+    if (pathname == NULL)
+    {
+        return false;
+    }
+    FILE *file = fopen(pathname, "rb");
+    if (file == NULL)
+    {
+        perror(pathname);
+        return false;
+    }
+    uint64_t size = get_file_size(file);
+    if (size == -1)
+    {
+        fclose(file);
+        return false;
+    }
+    if (!peer_write_uint64(p, size))
+    {
+        fclose(file);
+        return false;
+    }
+    uint8_t *content = OPENSSL_malloc(size);
+    if (content == NULL)
+    {
+        perror("malloc");
+        fclose(file);
+        return false;
+    }
+    if (fread(content, 1, size, file) != size)
+    {
+        perror("fread");
+        fclose(file);
+        OPENSSL_free(content);
+        return false;
+    }
+    if (fclose(file) != 0)
+    {
+        perror("fclose");
+        OPENSSL_free(content);
+        return false;
+    }
+    if (!peer_tls_write(p, content, size))
+    {
+        OPENSSL_free(content);
+        return false;
+    }
+    uint8_t *sig = peer_sig_sign(p, content, size);
+    if (sig == NULL)
+    {
+        OPENSSL_free(content);
+        return false;
+    }
+    OPENSSL_free(content);
+    if (!peer_tls_write(p, sig, p->sig->length_signature))
+    {
+        OPENSSL_free(sig);
+        return false;
+    }
+    OPENSSL_free(sig);
+    file_store_remove(p->upload_store, id);
+    return true;
+}
+
+bool peer_rx_download(peer_t *p)
+{
+    uint8_t count;
+    if (!peer_read_uint8(p, &count))
+    {
+        return false;
+    }
+    for (uint8_t i = 0; i < count; i++)
+    {
+        if (!peer_rx_download_file(p))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool peer_rx(peer_t *p)
 {
     while (true)
     {
         uint8_t b;
-        if (!peer_recv_byte(p, &b))
+        if (!peer_read_uint8(p, &b))
         {
             return false;
         }
         message_t mode = b;
         if (mode == MESSAGE_TEXT)
         {
-            if (!peer_recv_text(p))
+            if (!peer_rx_text(p))
             {
                 return false;
             }
         }
-        else if (mode == MESSAGE_FILE)
+        else if (mode == MESSAGE_UPLOAD)
         {
-            if (!peer_recv_files(p))
+            if (!peer_rx_upload(p))
+            {
+                return false;
+            }
+        }
+        else if (mode == MESSAGE_DOWNLOAD)
+        {
+            if (!peer_rx_download(p))
             {
                 return false;
             }
@@ -765,110 +906,34 @@ bool peer_recv(peer_t *p)
     }
 }
 
-bool peer_send_len(peer_t *p, size_t len)
+bool peer_tx_text(peer_t *p, char *text)
 {
-    uint8_t buf[8];
-    memcpy(buf, &len, 8);
-    return peer_tls_write(p, buf, 8);
-}
-
-bool peer_send_text(peer_t *p, char *text)
-{
-    if (!peer_send_byte(p, MESSAGE_TEXT))
+    if (!peer_write_uint8(p, MESSAGE_TEXT))
     {
         return false;
     }
-    size_t len = strlen(text);
-    return peer_send_len(p, len) && peer_tls_write(p, text, len);
+    uint16_t len = strlen(text);
+    return peer_write_uint16(p, len) && peer_tls_write(p, text, len);
 }
 
-bool peer_send_file(peer_t *p, char *pathname)
+bool peer_tx_upload_filename(peer_t *p, char *pathname)
 {
+    uint8_t id = p->upload_next_id++;
+    file_store_add(p->upload_store, id, pathname);
     char *filename = basename(pathname);
-    size_t filename_len = strlen(filename);
-    if (!peer_send_len(p, filename_len) || !peer_tls_write(p, filename, filename_len))
-    {
-        return false;
-    }
-    FILE *file = fopen(pathname, "rb");
-    if (file == NULL)
-    {
-        perror(pathname);
-        return false;
-    }
-    size_t file_len = get_file_len(file);
-    if (file_len == -1)
-    {
-        fclose(file);
-        return false;
-    }
-    if (!peer_send_len(p, file_len))
-    {
-        fclose(file);
-        return false;
-    }
-    uint8_t b;
-    if (!peer_recv_byte(p, &b))
-    {
-        fclose(file);
-        return false;
-    }
-    bool ack = b;
-    if (!ack)
-    {
-        fclose(file);
-        return true;
-    }
-    uint8_t *file_content = OPENSSL_malloc(file_len);
-    if (file_content == NULL)
-    {
-        perror("malloc");
-        fclose(file);
-        return false;
-    }
-    if (fread(file_content, 1, file_len, file) != file_len)
-    {
-        perror("fread");
-        fclose(file);
-        OPENSSL_free(file_content);
-        return false;
-    }
-    if (fclose(file) != 0)
-    {
-        perror("fclose");
-        OPENSSL_free(file_content);
-        return false;
-    }
-    if (!peer_tls_write(p, file_content, file_len))
-    {
-        OPENSSL_free(file_content);
-        return false;
-    }
-    uint8_t *sig = peer_sig_sign(p, file_content, file_len);
-    if (sig == NULL)
-    {
-        OPENSSL_free(file_content);
-        return false;
-    }
-    OPENSSL_free(file_content);
-    if (!peer_tls_write(p, sig, p->sig->length_signature))
-    {
-        OPENSSL_free(sig);
-        return false;
-    }
-    OPENSSL_free(sig);
-    return true;
+    uint8_t len = strlen(filename);
+    return peer_write_uint8(p, id) && peer_write_uint8(p, len) && peer_tls_write(p, filename, len);
 }
 
-bool peer_send_files(peer_t *p, char **pathnames, size_t pathnames_len)
+bool peer_tx_upload(peer_t *p, char **pathnames, uint8_t count)
 {
-    if (!peer_send_byte(p, MESSAGE_FILE) || !peer_send_len(p, pathnames_len))
+    if (!peer_write_uint8(p, MESSAGE_UPLOAD) || !peer_write_uint8(p, count))
     {
         return false;
     }
-    for (int i = 0; i < pathnames_len; i++)
+    for (uint8_t i = 0; i < count; i++)
     {
-        if (!peer_send_file(p, pathnames[i]))
+        if (!peer_tx_upload_filename(p, pathnames[i]))
         {
             return false;
         }
@@ -876,7 +941,38 @@ bool peer_send_files(peer_t *p, char **pathnames, size_t pathnames_len)
     return true;
 }
 
-bool peer_send(peer_t *p)
+bool peer_tx_download_file(peer_t *p, uint8_t id)
+{
+    char *filename = file_store_get(p->download_store, id);
+    if (filename == NULL)
+    {
+        return false;
+    }
+    if (!peer_write_uint8(p, id) || !peer_read_file(p, filename))
+    {
+        return false;
+    }
+    file_store_remove(p->download_store, id);
+    return true;
+}
+
+bool peer_tx_download(peer_t *p, char **ids, uint8_t count)
+{
+    if (!peer_write_uint8(p, MESSAGE_DOWNLOAD) || !peer_write_uint8(p, count))
+    {
+        return false;
+    }
+    for (uint8_t i = 0; i < count; i++)
+    {
+        if (!peer_tx_download_file(p, atoi(ids[i])))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool peer_tx(peer_t *p)
 {
     char buf[BUFFER_SIZE];
     while (true)
@@ -898,8 +994,15 @@ bool peer_send(peer_t *p)
             }
             switch (cmd->type)
             {
-            case CMD_TYPE_FILE:
-                if (!peer_send_files(p, cmd->args, cmd->args_len))
+            case CMD_TYPE_UPLOAD:
+                if (!peer_tx_upload(p, cmd->args, cmd->args_len))
+                {
+                    cmd_free(cmd);
+                    return false;
+                }
+                break;
+            case CMD_TYPE_DOWNLOAD:
+                if (!peer_tx_download(p, cmd->args, cmd->args_len))
                 {
                     cmd_free(cmd);
                     return false;
@@ -910,11 +1013,11 @@ bool peer_send(peer_t *p)
                 break;
             case CMD_TYPE_QUIT:
                 cmd_free(cmd);
-                return peer_send_byte(p, MESSAGE_QUIT);
+                return peer_write_uint8(p, MESSAGE_QUIT);
             }
             cmd_free(cmd);
         }
-        else if (!peer_send_text(p, buf))
+        else if (!peer_tx_text(p, buf))
         {
             return false;
         }
@@ -928,18 +1031,25 @@ bool peer_close(peer_t *p)
         return false;
     }
     peer_sig_free(p);
+    file_store_free(p->upload_store);
+    file_store_free(p->download_store);
     return true;
 }
 
 bool peer_run(peer_t *p)
 {
+    p->upload_store = file_store_new();
+    p->download_store = file_store_new();
     if (!peer_sig_init(p))
     {
         return false;
     }
     if (peer_connect(p))
     {
-        if (peer_recv(p))
+        file_store_add(p->upload_store, 1, "a.txt");
+        file_store_add(p->upload_store, 2, "b.txt");
+        file_store_add(p->upload_store, 3, "c.txt");
+        if (peer_rx(p))
         {
             if (peer_close(p))
             {
@@ -952,7 +1062,10 @@ bool peer_run(peer_t *p)
     }
     if (peer_accept(p))
     {
-        if (peer_send(p))
+        file_store_add(p->download_store, 1, "a.txt");
+        file_store_add(p->download_store, 2, "b.txt");
+        file_store_add(p->download_store, 3, "c.txt");
+        if (peer_tx(p))
         {
             if (peer_close(p))
             {
@@ -981,6 +1094,9 @@ int run_peer(int argc, char **argv)
         .sig_pkey = argv[5],
         .peer_fd = -1,
         .server_fd = -1,
+        .upload_next_id = 0,
+        .upload_store = NULL,
+        .download_store = NULL,
         .sig = NULL,
         .sig_pkey_buf = NULL,
         .ctx = NULL,
