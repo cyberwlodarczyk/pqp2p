@@ -26,9 +26,17 @@
 
 bool debug = false;
 
-void vflogf(FILE *file, const char *label, const char *color, const char *format, va_list args)
+void print_symbol(char symbol, int color)
 {
-    fprintf(file, "\033[%sm", color);
+    printf("\033[%dm", color);
+    putchar(symbol);
+    printf("\033[0m");
+    putchar(' ');
+}
+
+void vflogf(FILE *file, const char *label, int color, const char *format, va_list args)
+{
+    fprintf(file, "\033[%dm", color);
     fprintf(file, "[%s]", label);
     fprintf(file, "\033[0m");
     putc(' ', file);
@@ -44,7 +52,30 @@ void debugf(const char *format, ...)
     }
     va_list args;
     va_start(args, format);
-    vflogf(stdout, "debug", "90", format, args);
+    vflogf(stdout, "debug", 90, format, args);
+    va_end(args);
+}
+
+void fatalf(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vflogf(stderr, "fatal", 35, format, args);
+    va_end(args);
+}
+
+void vmsgf(char symbol, int color, const char *format, va_list args)
+{
+    print_symbol(symbol, color);
+    vprintf(format, args);
+    putchar('\n');
+}
+
+void commentf(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vmsgf('#', 90, format, args);
     va_end(args);
 }
 
@@ -52,8 +83,14 @@ void errorf(const char *format, ...)
 {
     va_list args;
     va_start(args, format);
-    vflogf(stderr, "error", "31", format, args);
+    vmsgf('!', 91, format, args);
     va_end(args);
+}
+
+void prompt()
+{
+    print_symbol('>', 94);
+    fflush(stdout);
 }
 
 char *add_sig_ext(char *filename)
@@ -90,6 +127,35 @@ uint64_t get_file_size(FILE *file)
         return -1;
     }
     return len;
+}
+
+bool str_to_uint8(char *str, uint8_t *n)
+{
+    size_t len = strlen(str);
+    if (len > 3)
+    {
+        return false;
+    }
+    if (len == 3 && (str[0] != '1' && str[0] != '2'))
+    {
+        return false;
+    }
+    uint8_t t = 0;
+    for (size_t i = 0; i < len; i++)
+    {
+        if (str[i] < '0' || str[i] > '9')
+        {
+            return false;
+        }
+        if (i == 0 && str[i] == '0')
+        {
+            return false;
+        }
+        t *= 10;
+        t += str[i] - '0';
+    }
+    *n = t;
+    return true;
 }
 
 typedef enum
@@ -146,7 +212,7 @@ cmd_t *cmd_parse(char *buf)
     if (c->type == -1)
     {
         OPENSSL_free(c);
-        errorf("invalid command: %s", buf);
+        fatalf("invalid command: %s", buf);
         return NULL;
     }
     size_t capacity = 4;
@@ -434,7 +500,7 @@ bool peer_tcp_connect(peer_t *p)
     peer_addr.sin_port = htons(PORT);
     if (inet_pton(AF_INET, p->addr, &peer_addr.sin_addr) == 0)
     {
-        errorf("invalid peer address: %s", p->addr);
+        fatalf("invalid peer address: %s", p->addr);
         close(peer_fd);
         return false;
     }
@@ -729,20 +795,16 @@ bool peer_rx_text(peer_t *p)
         return false;
     }
     text[len] = '\0';
-    printf("< %s\n", text);
+    print_symbol('<', 92);
+    printf("%s\n", text);
     OPENSSL_free(text);
     return true;
 }
 
 bool peer_rx_upload_filename(peer_t *p)
 {
-    uint8_t id;
-    if (!peer_read_uint8(p, &id))
-    {
-        return false;
-    }
-    uint8_t len;
-    if (!peer_read_uint8(p, &len))
+    uint8_t id, len;
+    if (!peer_read_uint8(p, &id) || !peer_read_uint8(p, &len))
     {
         return false;
     }
@@ -759,7 +821,7 @@ bool peer_rx_upload_filename(peer_t *p)
     }
     filename[len] = '\0';
     file_store_add(p->download_store, id, filename);
-    printf("# %s (%d)\n", filename, id);
+    commentf("%s (%d)", filename, id);
     return true;
 }
 
@@ -769,6 +831,18 @@ bool peer_rx_upload(peer_t *p)
     if (!peer_read_uint8(p, &count))
     {
         return false;
+    }
+    if (count == 0)
+    {
+        return true;
+    }
+    if (count == 1)
+    {
+        commentf("1 new file is available for download");
+    }
+    else
+    {
+        commentf("%d new files are available for download", count);
     }
     for (uint8_t i = 0; i < count; i++)
     {
@@ -792,6 +866,7 @@ bool peer_rx_download_file(peer_t *p)
     {
         return false;
     }
+    commentf("%s (%d)", pathname, id);
     FILE *file = fopen(pathname, "rb");
     if (file == NULL)
     {
@@ -858,6 +933,18 @@ bool peer_rx_download(peer_t *p)
     {
         return false;
     }
+    if (count == 0)
+    {
+        return true;
+    }
+    if (count == 1)
+    {
+        commentf("sending 1 file");
+    }
+    else
+    {
+        commentf("sending %d files", count);
+    }
     for (uint8_t i = 0; i < count; i++)
     {
         if (!peer_rx_download_file(p))
@@ -872,12 +959,11 @@ bool peer_rx(peer_t *p)
 {
     while (true)
     {
-        uint8_t b;
-        if (!peer_read_uint8(p, &b))
+        uint8_t mode;
+        if (!peer_read_uint8(p, &mode))
         {
             return false;
         }
-        message_t mode = b;
         if (mode == MESSAGE_TEXT)
         {
             if (!peer_rx_text(p))
@@ -927,6 +1013,11 @@ bool peer_tx_upload_filename(peer_t *p, char *pathname)
 
 bool peer_tx_upload(peer_t *p, char **pathnames, uint8_t count)
 {
+    if (count == 0)
+    {
+        errorf("no file paths specified");
+        return true;
+    }
     if (!peer_write_uint8(p, MESSAGE_UPLOAD) || !peer_write_uint8(p, count))
     {
         return false;
@@ -938,36 +1029,79 @@ bool peer_tx_upload(peer_t *p, char **pathnames, uint8_t count)
             return false;
         }
     }
+    if (count == 1)
+    {
+        commentf("1 file offered for download");
+    }
+    else
+    {
+        commentf("%d file(s) offered for download", count);
+    }
     return true;
 }
 
-bool peer_tx_download_file(peer_t *p, uint8_t id)
+bool peer_tx_download_file(peer_t *p, uint8_t id, char *filename)
 {
-    char *filename = file_store_get(p->download_store, id);
-    if (filename == NULL)
-    {
-        return false;
-    }
+    commentf("%s (%d)", filename, id);
     if (!peer_write_uint8(p, id) || !peer_read_file(p, filename))
     {
         return false;
     }
     file_store_remove(p->download_store, id);
+    // OPENSSL_free(filename);
     return true;
 }
 
-bool peer_tx_download(peer_t *p, char **ids, uint8_t count)
+bool peer_tx_download(peer_t *p, char **str_ids, uint8_t count)
 {
-    if (!peer_write_uint8(p, MESSAGE_DOWNLOAD) || !peer_write_uint8(p, count))
+    if (count == 0)
+    {
+        errorf("no file ids specified");
+        return true;
+    }
+    file_store_item_t *items = OPENSSL_malloc(count * sizeof(file_store_item_t));
+    if (items == NULL)
     {
         return false;
     }
     for (uint8_t i = 0; i < count; i++)
     {
-        if (!peer_tx_download_file(p, atoi(ids[i])))
+        file_store_item_t *item = &items[i];
+        if (!str_to_uint8(str_ids[i], &item->id))
         {
+            OPENSSL_free(items);
+            errorf("invalid file id \"%s\"", str_ids[i]);
+            return true;
+        }
+        item->pathname = file_store_get(p->download_store, item->id);
+        if (item->pathname == NULL)
+        {
+            OPENSSL_free(items);
+            errorf("file with id %d not found", item->id);
+            return true;
+        }
+    }
+    if (!peer_write_uint8(p, MESSAGE_DOWNLOAD) || !peer_write_uint8(p, count))
+    {
+        OPENSSL_free(items);
+        return false;
+    }
+    for (uint8_t i = 0; i < count; i++)
+    {
+        if (!peer_tx_download_file(p, items[i].id, items[i].pathname))
+        {
+            OPENSSL_free(items);
             return false;
         }
+    }
+    OPENSSL_free(items);
+    if (count == 1)
+    {
+        commentf("successfully downloaded 1 file");
+    }
+    else
+    {
+        commentf("successfully downloaded %d files", count);
     }
     return true;
 }
@@ -977,8 +1111,7 @@ bool peer_tx(peer_t *p)
     char buf[BUFFER_SIZE];
     while (true)
     {
-        printf("> ");
-        fflush(stdout);
+        prompt();
         if (fgets(buf, BUFFER_SIZE, stdin) == NULL)
         {
             perror("fgets");
@@ -1083,7 +1216,7 @@ int run_peer(int argc, char **argv)
 {
     if (argc != 6)
     {
-        errorf("usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>", argv[0]);
+        fatalf("usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>", argv[0]);
         return EXIT_FAILURE;
     }
     peer_t peer = {
