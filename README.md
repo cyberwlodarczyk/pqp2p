@@ -1,21 +1,25 @@
 # Post-Quantum P2P
 
-### OpenSSL
+## Introduction
+
+pqp2p is a command-line chat that uses quantum-resistant cryptography to provide secure communication via direct tunnel between two peers and allows sending both text messages and files. It uses [liboqs](https://openquantumsafe.org/) and OpenSSL to establish standard TLS connection but with post-quantum cryptographic algorithms: **Dilithium** and **Kyber**. Because of the difficulties related to proper installation and configuration of certain libraries, dedicated Docker images have been made for development and testing. pqp2p requires two peers to have their own certificates signed by the same certificate authority. Additionally, files sent can be signed and then verified by the receiving peer using separate key pairs.
+
+## Example
+
+### Docker
+
+Docker images for CA and peer have necessary binaries and files prepared and ready to use. **Disclaimer:** containers can and are intended to be run on different machines, but hosts have to be on the same network, because pqp2p does not implement mechanisms to handle communication behind NAT or over the internet.
 
 ```bash
-# create private key and self-signed root certificate for the certificate authority
-openssl req -x509 -new -newkey dilithium5 -keyout ca-cert-pkey.pem -out ca-cert.pem -config /workspaces/pqp2p/openssl/ca.cnf
-# create private key and certificate signing request for the peer
-openssl req -new -newkey dilithium5 -keyout cert-pkey.pem -out csr.pem -config /workspaces/pqp2p/openssl/peer.cnf
-# issue certificate from the certificate authority
-openssl ca -in csr.pem -out cert.pem -cert ca-cert.pem -keyfile ca-cert-pkey.pem -config /workspaces/pqp2p/openssl/ca.cnf
-# generate public-private key pair
-openssl genpkey -algorithm dilithium5 -out sig-pkey.pem -outpubkey sig-pubkey.pem -aes256 -provider oqsprovider -provider default
-# verify file signature
-openssl pkeyutl -verify -pubin -inkey sig-pubkey.pem -in data.txt -sigfile data.txt.sig -provider oqsprovider -provider default
+# run docker container for the certificate authority
+docker run -it cyberwlodarczyk/pqp2p:ca
+# run docker container for the peer
+docker run -it cyberwlodarczyk/pqp2p:peer
 ```
 
 ### [uguu.se](https://uguu.se/)
+
+External service must be used in order to exchange signing requests, certificates and public keys. For testing and demonstration, simple and free file sharing services like [uguu.se](https://uguu.se/) are helpful.
 
 ```bash
 # upload file
@@ -24,30 +28,28 @@ curl -F files[]=@data.txt https://uguu.se/upload
 curl -o data.txt https://d.uguu.se/OlATWQRq
 ```
 
-### Komendy dla peera (alice - nadawca)
+### Certificate Authority
+
+CA must have its own certificate and private key files stored in configured paths. Then two signing requests from both peers have to be accepted.
 
 ```bash
-# create private key and certificate signing request for the peer
-openssl req -new -newkey dilithium5 -keyout cert-pkey.pem -out csr.pem
-#przeslanie csr do CA
-curl -F "file=@data.txt" https://file.io
-#odebranie pliku od CA
-curl -o data.txt https://file.io
-# generate public-private key pair
-openssl genpkey -algorithm dilithium5 -out sig-pkey.pem -outpubkey sig-pubkey.pem -aes256
-#przeslanie klucza publicznego do boba
-curl -F "file=@data.txt" https://file.io
-#odebranie klucza publicznego od boba
-curl -o data.txt https://file.io
-#przeslij plik
-0.0.1 cert.pem cert-pkey.pem ca-cert.pem sig-pkey.pem
+# create private key and self-signed root certificate
+openssl req -x509 -new -newkey dilithium5 -keyout private/ca-key.pem -out certs/ca-cert.pem
+# issue certificate based on signing request
+openssl ca -in csr.pem -out cert.pem -cert certs/ca-cert.pem -keyfile private/ca-key.pem
 ```
 
-### Dodatkowo dla odbiorcy:
+### Peer
+
+Each peer needs to create their own private key and certificate signing request. Moreover, separate key pair used for file signing has to be generated.
 
 ```bash
-#odbierz plik
-pqp2p 127.0.0.1 cert.pem cert-pkey.pem ca-cert.pem sig-pkey.pem
-#zweryfikuj poprawnosc pliku
-openssl pkeyutl -verify -pubin -inkey klucz-peera.pem -in plik.txt -sigfile plik.txt.sig
+# create private key and certificate signing request
+openssl req -new -newkey dilithium5 -keyout key.pem -out csr.pem
+# generate public-private key pair
+openssl genpkey -algorithm dilithium5 -out sig-pkey.pem -outpubkey sig-pubkey.pem -aes256
+# connect to remote peer
+pqp2p 192.168.0.5 cert.pem key.pem ca-cert.pem sig-pkey.pem
+# verify received file signature
+openssl pkeyutl -verify -pubin -inkey peer-sig-pubkey.pem -in data.txt -sigfile data.txt.sig
 ```

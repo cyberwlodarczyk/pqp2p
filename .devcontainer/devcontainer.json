@@ -1,5 +1,5 @@
 {
-  "name": "Post-Quantum P2P Dev Container",
+  "name": "Post-Quantum P2P",
   "image": "docker.io/cyberwlodarczyk/pqp2p:dev",
   "customizations": {
     "vscode": {
