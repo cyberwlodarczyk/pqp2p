@@ -7,7 +7,7 @@ ARG LIBOQS_DIR=/opt/liboqs
 ARG CFLAGS="-I${OPENSSL_DIR}/include -I${LIBOQS_DIR}/include"
 ARG LDFLAGS="-L${OPENSSL_DIR}/lib -L${LIBOQS_DIR}/lib -Wl,-rpath,${OPENSSL_DIR}/lib:${LIBOQS_DIR}/lib"
 ARG PQP2P_OUT=/bin/pqp2p
-ARG PQKEYPAIR_OUT=/bin/pqkeypair
+ARG PQKEYGEN_OUT=/bin/pqkeygen
 ARG PQVERIFY_OUT=/bin/pqverify
 
 FROM alpine:${ALPINE_VERSION} AS build
@@ -17,7 +17,7 @@ ARG LIBOQS_DIR
 ARG CFLAGS
 ARG LDFLAGS
 ARG PQP2P_OUT
-ARG PQKEYPAIR_OUT
+ARG PQKEYGEN_OUT
 ARG PQVERIFY_OUT
 RUN apk add --no-cache build-base linux-headers libtool automake autoconf cmake ninja make git
 WORKDIR /build
@@ -39,9 +39,9 @@ RUN cmake --build build
 RUN cmake --install build
 RUN cp build/lib/oqsprovider.so ${OPENSSL_MODULES}
 WORKDIR /build/pqp2p
-COPY main.c keypair.c verify.c ./
+COPY src/* ./
 RUN gcc -Wall ${CFLAGS} ${LDFLAGS} -o ${PQP2P_OUT} main.c -loqs -lcrypto -lssl
-RUN gcc -Wall ${CFLAGS} ${LDFLAGS} -o ${PQKEYPAIR_OUT} keypair.c -loqs -lcrypto -lssl
+RUN gcc -Wall ${CFLAGS} ${LDFLAGS} -o ${PQKEYGEN_OUT} keygen.c -lcrypto
 RUN gcc -Wall ${CFLAGS} ${LDFLAGS} -o ${PQVERIFY_OUT} verify.c -loqs -lcrypto -lssl
 
 FROM alpine:${ALPINE_VERSION} AS dev
@@ -86,17 +86,20 @@ ARG OPENSSL_DIR
 ARG OPENSSL_MODULES
 ARG OPENSSL_PATH
 ARG OPENSSL_CONFIG
+ARG LIBOQS_DIR
 ARG PQP2P_OUT
-ARG PQKEYPAIR_OUT
+ARG PQKEYGEN_OUT
 ARG PQVERIFY_OUT
 COPY --from=build ${OPENSSL_DIR} ${OPENSSL_DIR}
+COPY --from=build ${LIBOQS_DIR} ${LIBOQS_DIR}
 COPY openssl/peer.cnf ${OPENSSL_CONFIG}
 COPY --from=build ${PQP2P_OUT} ${PQP2P_OUT}
-COPY --from=build ${PQKEYPAIR_OUT} ${PQKEYPAIR_OUT}
+COPY --from=build ${PQKEYGEN_OUT} ${PQKEYGEN_OUT}
 COPY --from=build ${PQVERIFY_OUT} ${PQVERIFY_OUT}
 RUN apk add --no-cache curl
 ENV OPENSSL_DIR=${OPENSSL_DIR}
 ENV OPENSSL_MODULES=${OPENSSL_MODULES}
+ENV LIBOQS_DIR=${LIBOQS_DIR}
 ENV PATH=${OPENSSL_PATH}:${PATH}
 WORKDIR /home/peer
 RUN adduser -D -h /home/peer peer

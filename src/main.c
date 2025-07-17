@@ -329,9 +329,9 @@ bool file_store_remove(file_store_t *fs, uint8_t id)
     return false;
 }
 
-void file_store_free(file_store_t *s)
+void file_store_free(file_store_t *fs)
 {
-    OPENSSL_free(s);
+    OPENSSL_free(fs);
 }
 
 typedef struct
@@ -1212,12 +1212,12 @@ bool peer_run(peer_t *p)
     return false;
 }
 
-int run_peer(int argc, char **argv)
+bool run(int argc, char **argv)
 {
     if (argc != 6)
     {
         fatalf("usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>", argv[0]);
-        return EXIT_FAILURE;
+        return false;
     }
     peer_t peer = {
         .addr = argv[1],
@@ -1235,62 +1235,56 @@ int run_peer(int argc, char **argv)
         .ctx = NULL,
         .ssl = NULL,
     };
-    return peer_run(&peer) ? EXIT_SUCCESS : EXIT_FAILURE;
+    return peer_run(&peer);
 }
 
-int run_with_oqs_provider(int argc, char **argv)
+bool run_with_oqs_provider(int argc, char **argv)
 {
     OSSL_PROVIDER *default_prov = OSSL_PROVIDER_load(NULL, "default");
     if (default_prov == NULL)
     {
         ERR_print_errors_fp(stderr);
-        return EXIT_FAILURE;
+        return false;
     }
     OSSL_PROVIDER *oqs_prov = OSSL_PROVIDER_load(NULL, "oqsprovider");
     if (oqs_prov == NULL)
     {
         ERR_print_errors_fp(stderr);
-        return EXIT_FAILURE;
+        return false;
     }
-    int code = run_peer(argc, argv);
-    if (code == EXIT_FAILURE)
+    if (!run(argc, argv))
     {
         OSSL_PROVIDER_unload(default_prov);
         OSSL_PROVIDER_unload(oqs_prov);
-        return EXIT_FAILURE;
+        return false;
     }
     if (OSSL_PROVIDER_unload(default_prov) == 0)
     {
         ERR_print_errors_fp(stderr);
-        return EXIT_FAILURE;
+        return false;
     }
     if (OSSL_PROVIDER_unload(oqs_prov) == 0)
     {
         ERR_print_errors_fp(stderr);
-        return EXIT_FAILURE;
+        return false;
     }
-    return EXIT_SUCCESS;
+    return true;
 }
 
-int run_with_oqs(int argc, char **argv)
+bool run_with_oqs(int argc, char **argv)
 {
     debugf("using oqs version %s", OQS_version());
     OQS_init();
-    int code = run_with_oqs_provider(argc, argv);
+    bool ok = run_with_oqs_provider(argc, argv);
     OQS_destroy();
-    return code;
-}
-
-int run(int argc, char **argv)
-{
-    char *debug_env = getenv("DEBUG");
-    debug = debug_env != NULL && strcmp(debug_env, "true") == 0;
-    int code = run_with_oqs(argc, argv);
-    debugf("exit status %d", code);
-    return code;
+    return ok;
 }
 
 int main(int argc, char **argv)
 {
-    return run(argc, argv);
+    char *debug_env = getenv("DEBUG");
+    debug = debug_env != NULL && strcmp(debug_env, "true") == 0;
+    int code = run_with_oqs(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE;
+    debugf("exit status %d", code);
+    return code;
 }
