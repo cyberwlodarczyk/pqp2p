@@ -4,39 +4,41 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/provider.h>
+#include <oqs/oqs.h>
+
+#define SIGNATURE_ALGORITHM OQS_SIG_alg_dilithium_5
 
 typedef struct
 {
-    EVP_PKEY_CTX *ctx;
-    EVP_PKEY *key;
+    EVP_PKEY_CTX *pkey_ctx;
+    EVP_PKEY *pkey;
 } evp_t;
 
 bool evp_init(evp_t *e)
 {
-    e->ctx = NULL;
-    e->ctx = EVP_PKEY_CTX_new_from_name(NULL, "dilithium5", NULL);
-    if (e->ctx == NULL)
+    e->pkey_ctx = EVP_PKEY_CTX_new_from_name(NULL, SIGNATURE_ALGORITHM, NULL);
+    if (e->pkey_ctx == NULL)
     {
         ERR_print_errors_fp(stderr);
         return false;
     }
-    if (EVP_PKEY_keygen_init(e->ctx) <= 0)
+    if (EVP_PKEY_keygen_init(e->pkey_ctx) <= 0)
     {
-        EVP_PKEY_CTX_free(e->ctx);
+        EVP_PKEY_CTX_free(e->pkey_ctx);
         ERR_print_errors_fp(stderr);
         return false;
     }
-    e->key = NULL;
-    if (EVP_PKEY_keygen(e->ctx, &e->key) <= 0)
+    e->pkey = NULL;
+    if (EVP_PKEY_keygen(e->pkey_ctx, &e->pkey) <= 0)
     {
-        EVP_PKEY_CTX_free(e->ctx);
+        EVP_PKEY_CTX_free(e->pkey_ctx);
         ERR_print_errors_fp(stderr);
         return false;
     }
     return true;
 }
 
-bool evp_write(evp_t e, char *pkey_out, char *pubkey_out)
+bool evp_keygen(evp_t e, char *pkey_out, char *pubkey_out)
 {
     FILE *pkey_file = fopen(pkey_out, "wb");
     if (pkey_file == NULL)
@@ -46,7 +48,7 @@ bool evp_write(evp_t e, char *pkey_out, char *pubkey_out)
     }
     if (PEM_write_PrivateKey(
             pkey_file,
-            e.key,
+            e.pkey,
             EVP_aes_256_cbc(),
             NULL,
             0,
@@ -67,7 +69,7 @@ bool evp_write(evp_t e, char *pkey_out, char *pubkey_out)
         perror(pubkey_out);
         return false;
     }
-    if (PEM_write_PUBKEY(pubkey_file, e.key) == 0)
+    if (PEM_write_PUBKEY(pubkey_file, e.pkey) == 0)
     {
         ERR_print_errors_fp(stderr);
         return false;
@@ -82,8 +84,8 @@ bool evp_write(evp_t e, char *pkey_out, char *pubkey_out)
 
 void evp_free(evp_t e)
 {
-    EVP_PKEY_free(e.key);
-    EVP_PKEY_CTX_free(e.ctx);
+    EVP_PKEY_free(e.pkey);
+    EVP_PKEY_CTX_free(e.pkey_ctx);
 }
 
 bool run(int argc, char **argv)
@@ -100,7 +102,7 @@ bool run(int argc, char **argv)
     {
         return false;
     }
-    bool ok = evp_write(evp, pkey_out, pubkey_out);
+    bool ok = evp_keygen(evp, pkey_out, pubkey_out);
     evp_free(evp);
     return ok;
 }

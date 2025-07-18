@@ -46,10 +46,14 @@ Each peer needs to create their own private key and certificate signing request.
 ```bash
 # create private key and certificate signing request
 openssl req -new -newkey dilithium5 -keyout key.pem -out csr.pem
-# generate public-private key pair
+# generate public-private key pair (method 1)
 openssl genpkey -algorithm dilithium5 -out sig-pkey.pem -outpubkey sig-pubkey.pem -aes256
+# generate public-private key pair (method 2)
+pqkeygen sig-pkey.pem sig-pubkey.pem
 # connect to remote peer
 pqp2p 192.168.0.5 cert.pem key.pem ca-cert.pem sig-pkey.pem
-# verify received file signature
-openssl pkeyutl -verify -pubin -inkey peer-sig-pubkey.pem -in data.txt -sigfile data.txt.sig
+# verify received file signature (method 1)
+openssl dgst -verify peer-sig-pubkey.pem -signature data.txt.sig -sha256 data.txt
+# verify received file signature (method 2)
+pqverify data.txt data.txt.sig peer-sig-pubkey.pem
 ```
