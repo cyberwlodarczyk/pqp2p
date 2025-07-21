@@ -3,15 +3,15 @@
 #include <stdbool.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <openssl/provider.h>
-#include <oqs/oqs.h>
 
-#define SIGNATURE_ALGORITHM OQS_SIG_alg_dilithium_5
+#define SIGNATURE_ALGORITHM LN_ML_DSA_87
+#define CIPHER_ALGORITHM LN_aes_256_cbc
 
 typedef struct
 {
     EVP_PKEY_CTX *pkey_ctx;
     EVP_PKEY *pkey;
+    EVP_CIPHER *cipher;
 } evp_t;
 
 bool evp_init(evp_t *e)
@@ -35,6 +35,14 @@ bool evp_init(evp_t *e)
         ERR_print_errors_fp(stderr);
         return false;
     }
+    e->cipher = EVP_CIPHER_fetch(NULL, CIPHER_ALGORITHM, NULL);
+    if (e->cipher == NULL)
+    {
+        EVP_PKEY_free(e->pkey);
+        EVP_PKEY_CTX_free(e->pkey_ctx);
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
     return true;
 }
 
@@ -49,7 +57,7 @@ bool evp_keygen(evp_t e, char *pkey_out, char *pubkey_out)
     if (PEM_write_PrivateKey(
             pkey_file,
             e.pkey,
-            EVP_aes_256_cbc(),
+            e.cipher,
             NULL,
             0,
             NULL,
@@ -84,6 +92,7 @@ bool evp_keygen(evp_t e, char *pkey_out, char *pubkey_out)
 
 void evp_free(evp_t e)
 {
+    EVP_CIPHER_free(e.cipher);
     EVP_PKEY_free(e.pkey);
     EVP_PKEY_CTX_free(e.pkey_ctx);
 }
@@ -107,40 +116,7 @@ bool run(int argc, char **argv)
     return ok;
 }
 
-bool run_with_oqs_provider(int argc, char **argv)
-{
-    OSSL_PROVIDER *default_prov = OSSL_PROVIDER_load(NULL, "default");
-    if (default_prov == NULL)
-    {
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
-    OSSL_PROVIDER *oqs_prov = OSSL_PROVIDER_load(NULL, "oqsprovider");
-    if (oqs_prov == NULL)
-    {
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
-    if (!run(argc, argv))
-    {
-        OSSL_PROVIDER_unload(default_prov);
-        OSSL_PROVIDER_unload(oqs_prov);
-        return false;
-    }
-    if (OSSL_PROVIDER_unload(default_prov) == 0)
-    {
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
-    if (OSSL_PROVIDER_unload(oqs_prov) == 0)
-    {
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
-    return true;
-}
-
 int main(int argc, char **argv)
 {
-    return run_with_oqs_provider(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE;
+    return run(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

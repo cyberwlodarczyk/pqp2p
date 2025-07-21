@@ -3,13 +3,14 @@
 #include <stdbool.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <openssl/provider.h>
-#include <oqs/oqs.h>
 
 #define BUFFER_SIZE 4096
-#define SIGNATURE_LENGTH OQS_SIG_dilithium_5_length_signature
+#define SIGNATURE_ALGORITHM LN_ML_DSA_87
+#define SIGNATURE_LENGTH 4627
+#define DIGEST_ALGORITHM LN_sha256
+#define DIGEST_LENGTH 32
 
-uint8_t *read_signature(char *path)
+uint8_t *read_sig(char *path)
 {
     FILE *file = fopen(path, "rb");
     if (file == NULL)
@@ -17,15 +18,15 @@ uint8_t *read_signature(char *path)
         perror(path);
         return NULL;
     }
-    uint8_t *buf = OPENSSL_malloc(SIGNATURE_LENGTH);
-    if (buf == NULL)
+    uint8_t *sig = OPENSSL_malloc(SIGNATURE_LENGTH);
+    if (sig == NULL)
     {
         fclose(file);
         perror("malloc");
         return NULL;
     }
     if (fread(
-            buf,
+            sig,
             1,
             SIGNATURE_LENGTH,
             file) != SIGNATURE_LENGTH)
@@ -38,17 +39,17 @@ uint8_t *read_signature(char *path)
         {
             perror("fread");
         }
-        OPENSSL_free(buf);
+        OPENSSL_free(sig);
         fclose(file);
         return NULL;
     }
     if (fclose(file) != 0)
     {
-        OPENSSL_free(buf);
+        OPENSSL_free(sig);
         perror("fclose");
         return NULL;
     }
-    return buf;
+    return sig;
 }
 
 EVP_PKEY *read_pubkey(char *path)
@@ -72,6 +73,16 @@ EVP_PKEY *read_pubkey(char *path)
         perror("fclose");
         return NULL;
     }
+    if (OBJ_ln2nid(EVP_PKEY_get0_type_name(pkey)) !=
+        OBJ_ln2nid(SIGNATURE_ALGORITHM))
+    {
+        EVP_PKEY_free(pkey);
+        fprintf(
+            stderr,
+            "signature algorithm is not \"%s\"\n",
+            SIGNATURE_ALGORITHM);
+        return NULL;
+    }
     return pkey;
 }
 
@@ -79,7 +90,9 @@ typedef struct
 {
     EVP_MD_CTX *md_ctx;
     EVP_MD *md;
+    EVP_PKEY_CTX *pkey_ctx;
     EVP_PKEY *pkey;
+    EVP_SIGNATURE *sig;
 } evp_t;
 
 bool evp_init(evp_t *e, char *pubkey_path)
@@ -90,7 +103,7 @@ bool evp_init(evp_t *e, char *pubkey_path)
         ERR_print_errors_fp(stderr);
         return false;
     }
-    e->md = EVP_MD_fetch(NULL, "SHA2-256", NULL);
+    e->md = EVP_MD_fetch(NULL, DIGEST_ALGORITHM, NULL);
     if (e->md == NULL)
     {
         EVP_MD_CTX_free(e->md_ctx);
@@ -104,21 +117,40 @@ bool evp_init(evp_t *e, char *pubkey_path)
         EVP_MD_CTX_free(e->md_ctx);
         return false;
     }
+    e->pkey_ctx = EVP_PKEY_CTX_new_from_pkey(NULL, e->pkey, NULL);
+    if (e->pkey_ctx == NULL)
+    {
+        EVP_PKEY_free(e->pkey);
+        EVP_MD_free(e->md);
+        EVP_MD_CTX_free(e->md_ctx);
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+    e->sig = EVP_SIGNATURE_fetch(NULL, SIGNATURE_ALGORITHM, NULL);
+    if (e->sig == NULL)
+    {
+        EVP_PKEY_free(e->pkey);
+        EVP_PKEY_CTX_free(e->pkey_ctx);
+        EVP_MD_free(e->md);
+        EVP_MD_CTX_free(e->md_ctx);
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
     return true;
 }
 
-int evp_verify(evp_t e, FILE *file, uint8_t *sig)
+uint8_t *evp_digest(evp_t e, FILE *file)
 {
-    if (EVP_DigestVerifyInit(e.md_ctx, NULL, e.md, NULL, e.pkey) != 1)
+    if (EVP_DigestInit(e.md_ctx, e.md) != 1)
     {
         ERR_print_errors_fp(stderr);
-        return -1;
+        return NULL;
     }
     uint8_t *buf = OPENSSL_malloc(BUFFER_SIZE);
     if (buf == NULL)
     {
         perror("malloc");
-        return -1;
+        return NULL;
     }
     while (true)
     {
@@ -127,13 +159,13 @@ int evp_verify(evp_t e, FILE *file, uint8_t *sig)
         {
             OPENSSL_free(buf);
             perror("fread");
-            return -1;
+            return NULL;
         }
-        if (EVP_DigestVerifyUpdate(e.md_ctx, buf, n) != 1)
+        if (EVP_DigestUpdate(e.md_ctx, buf, n) != 1)
         {
             OPENSSL_free(buf);
             ERR_print_errors_fp(stderr);
-            return -1;
+            return NULL;
         }
         if (feof(file))
         {
@@ -141,7 +173,34 @@ int evp_verify(evp_t e, FILE *file, uint8_t *sig)
             break;
         }
     }
-    switch (EVP_DigestVerifyFinal(e.md_ctx, sig, SIGNATURE_LENGTH))
+    uint8_t *digest = OPENSSL_malloc(DIGEST_LENGTH);
+    if (digest == NULL)
+    {
+        perror("malloc");
+        return NULL;
+    }
+    if (EVP_DigestFinal(e.md_ctx, digest, NULL) != 1)
+    {
+        OPENSSL_free(digest);
+        ERR_print_errors_fp(stderr);
+        return NULL;
+    }
+    return digest;
+}
+
+int evp_verify(evp_t e, uint8_t *sig, uint8_t *digest)
+{
+    if (EVP_PKEY_verify_message_init(e.pkey_ctx, e.sig, NULL) != 1)
+    {
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+    switch (EVP_PKEY_verify(
+        e.pkey_ctx,
+        sig,
+        SIGNATURE_LENGTH,
+        digest,
+        DIGEST_LENGTH))
     {
     case 1:
         return 1;
@@ -155,7 +214,9 @@ int evp_verify(evp_t e, FILE *file, uint8_t *sig)
 
 void evp_free(evp_t e)
 {
+    EVP_SIGNATURE_free(e.sig);
     EVP_PKEY_free(e.pkey);
+    EVP_PKEY_CTX_free(e.pkey_ctx);
     EVP_MD_free(e.md);
     EVP_MD_CTX_free(e.md_ctx);
 }
@@ -171,29 +232,44 @@ bool run(int argc, char **argv)
         return EXIT_FAILURE;
     }
     char *file_path = argv[1];
-    char *signature_path = argv[2];
+    char *sig_path = argv[2];
     char *pubkey_path = argv[3];
     evp_t evp;
     if (!evp_init(&evp, pubkey_path))
     {
         return false;
     }
-    uint8_t *signature = read_signature(signature_path);
-    if (signature == NULL)
-    {
-        evp_free(evp);
-        return false;
-    }
     FILE *file = fopen(file_path, "rb");
     if (file == NULL)
     {
-        OPENSSL_free(signature);
         evp_free(evp);
         perror(file_path);
         return false;
     }
-    int ok = evp_verify(evp, file, signature);
-    OPENSSL_free(signature);
+    uint8_t *digest = evp_digest(evp, file);
+    if (digest == NULL)
+    {
+        fclose(file);
+        evp_free(evp);
+        return false;
+    }
+    if (fclose(file) != 0)
+    {
+        OPENSSL_free(digest);
+        evp_free(evp);
+        perror("fclose");
+        return false;
+    }
+    uint8_t *sig = read_sig(sig_path);
+    if (sig == NULL)
+    {
+        OPENSSL_free(digest);
+        evp_free(evp);
+        return false;
+    }
+    int ok = evp_verify(evp, sig, digest);
+    OPENSSL_free(sig);
+    OPENSSL_free(digest);
     evp_free(evp);
     switch (ok)
     {
@@ -204,45 +280,6 @@ bool run(int argc, char **argv)
         printf("signature is invalid\n");
         break;
     case -1:
-        fclose(file);
-        return false;
-    }
-    if (fclose(file) != 0)
-    {
-        perror("fclose");
-        return false;
-    }
-    return true;
-}
-
-bool run_with_oqs_provider(int argc, char **argv)
-{
-    OSSL_PROVIDER *default_prov = OSSL_PROVIDER_load(NULL, "default");
-    if (default_prov == NULL)
-    {
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
-    OSSL_PROVIDER *oqs_prov = OSSL_PROVIDER_load(NULL, "oqsprovider");
-    if (oqs_prov == NULL)
-    {
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
-    if (!run(argc, argv))
-    {
-        OSSL_PROVIDER_unload(default_prov);
-        OSSL_PROVIDER_unload(oqs_prov);
-        return false;
-    }
-    if (OSSL_PROVIDER_unload(default_prov) == 0)
-    {
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
-    if (OSSL_PROVIDER_unload(oqs_prov) == 0)
-    {
-        ERR_print_errors_fp(stderr);
         return false;
     }
     return true;
@@ -250,5 +287,5 @@ bool run_with_oqs_provider(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-    return run_with_oqs_provider(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE;
+    return run(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -11,41 +11,51 @@
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <openssl/ssl.h>
-#include <openssl/pem.h>
-#include <openssl/rsa.h>
-#include <openssl/evp.h>
 #include <openssl/err.h>
-#include <openssl/provider.h>
-#include <oqs/oqs.h>
 
 #define PORT 1683
 #define BUFFER_SIZE 4096
-#define SIGNATURE_ALGORITHM OQS_SIG_alg_dilithium_5
-#define SIGNATURE_LENGTH OQS_SIG_dilithium_5_length_signature
+#define SIGNATURE_ALGORITHM LN_ML_DSA_87
+#define SIGNATURE_LENGTH 4627
 #define SIGNATURE_EXTENSION ".sig"
 #define SIGNATURE_EXTENSION_LENGTH (sizeof(SIGNATURE_EXTENSION) - 1)
+#define DIGEST_ALGORITHM LN_sha256
+#define DIGEST_LENGTH 32
+#define TLS_GROUP "MLKEM1024"
 #define CMD_PREFIX_CHAR '\\'
+#define EPOLL_MAX_EVENTS 2
 
-bool debug = false;
-bool newline = true;
+bool is_debug = false;
+bool is_newline = true;
+bool is_error = false;
 
 void ensure_newline(FILE *file)
 {
-    if (!newline)
+    if (!is_newline)
     {
         putc('\n', file);
-        newline = true;
+        is_newline = true;
     }
 }
 
 void print_errno(char *label)
 {
+    if (is_error)
+    {
+        return;
+    }
+    is_error = true;
     ensure_newline(stderr);
     perror(label);
 }
 
 void print_openssl_errors()
 {
+    if (is_error)
+    {
+        return;
+    }
+    is_error = true;
     ensure_newline(stderr);
     ERR_print_errors_fp(stderr);
 }
@@ -62,7 +72,7 @@ void prompt()
 {
     print_symbol('>', 94);
     fflush(stdout);
-    newline = false;
+    is_newline = false;
 }
 
 void vflogf(FILE *file, const char *label, int color, const char *format, va_list args)
@@ -78,7 +88,7 @@ void vflogf(FILE *file, const char *label, int color, const char *format, va_lis
 
 void debugf(const char *format, ...)
 {
-    if (!debug)
+    if (!is_debug)
     {
         return;
     }
@@ -120,6 +130,14 @@ void errorf(const char *format, ...)
     va_end(args);
 }
 
+void eprintf(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+}
+
 EVP_PKEY *read_evp_pkey(char *path)
 {
     FILE *file = fopen(path, "rb");
@@ -139,6 +157,13 @@ EVP_PKEY *read_evp_pkey(char *path)
     {
         EVP_PKEY_free(pkey);
         print_errno("fclose");
+        return NULL;
+    }
+    if (OBJ_ln2nid(EVP_PKEY_get0_type_name(pkey)) !=
+        OBJ_ln2nid(SIGNATURE_ALGORITHM))
+    {
+        EVP_PKEY_free(pkey);
+        eprintf("signature algorithm is not \"%s\"\n", SIGNATURE_ALGORITHM);
         return NULL;
     }
     return pkey;
@@ -263,7 +288,7 @@ cmd_t *cmd_parse(char *buf)
     if (c->type == -1)
     {
         OPENSSL_free(c);
-        fatalf("invalid command: %s", buf);
+        errorf("invalid command: %s", buf);
         return NULL;
     }
     size_t capacity = 4;
@@ -414,7 +439,9 @@ typedef struct
     SSL *ssl;
     EVP_MD_CTX *evp_md_ctx;
     EVP_MD *evp_md;
+    EVP_PKEY_CTX *evp_pkey_ctx;
     EVP_PKEY *evp_pkey;
+    EVP_SIGNATURE *evp_sig;
 } peer_t;
 
 bool peer_tcp_accept(peer_t *p)
@@ -497,7 +524,7 @@ bool peer_tcp_connect(peer_t *p)
     peer_addr.sin_port = htons(PORT);
     if (inet_pton(AF_INET, p->addr, &peer_addr.sin_addr) == 0)
     {
-        fatalf("invalid peer address: %s", p->addr);
+        eprintf("invalid peer address: %s\n", p->addr);
         close(peer_fd);
         return false;
     }
@@ -530,11 +557,11 @@ bool peer_tls_init(peer_t *p, const SSL_METHOD *meth, int mode, int (*handshake_
         return false;
     }
     p->ssl_ctx = ctx;
-    if (SSL_CTX_set1_groups_list(ctx, "kyber1024") != 1)
+    if (SSL_CTX_set1_groups_list(ctx, TLS_GROUP) != 1)
     {
         return false;
     }
-    if (SSL_CTX_set1_sigalgs_list(ctx, "dilithium5") != 1)
+    if (SSL_CTX_set1_sigalgs_list(ctx, SIGNATURE_ALGORITHM) != 1)
     {
         return false;
     }
@@ -652,6 +679,47 @@ bool peer_accept(peer_t *p)
 bool peer_connect(peer_t *p)
 {
     return peer_tcp_connect(p) && peer_tls_connect(p);
+}
+
+bool peer_epoll_init(peer_t *p)
+{
+    p->epoll_fd = epoll_create1(0);
+    if (p->epoll_fd == -1)
+    {
+        print_errno("epoll_create1");
+        return false;
+    }
+    struct epoll_event event;
+    event.events = EPOLLIN;
+    event.data.fd = STDIN_FILENO;
+    if (epoll_ctl(p->epoll_fd, EPOLL_CTL_ADD, STDIN_FILENO, &event) == -1)
+    {
+        print_errno("epoll_ctl");
+        return false;
+    }
+    event.data.fd = p->peer_fd;
+    if (epoll_ctl(p->epoll_fd, EPOLL_CTL_ADD, p->peer_fd, &event) == -1)
+    {
+        print_errno("epoll_ctl");
+        return false;
+    }
+    return true;
+}
+
+int peer_epoll_wait(peer_t *p, int fds[EPOLL_MAX_EVENTS])
+{
+    static struct epoll_event events[EPOLL_MAX_EVENTS];
+    int n = epoll_wait(p->epoll_fd, events, 2, -1);
+    if (n == -1)
+    {
+        print_errno("epoll_wait");
+        return -1;
+    }
+    for (int i = 0; i < n; i++)
+    {
+        fds[i] = events[i].data.fd;
+    }
+    return n;
 }
 
 bool peer_read_uint8(peer_t *p, uint8_t *n)
@@ -780,7 +848,7 @@ bool peer_evp_init(peer_t *p)
         print_openssl_errors();
         return false;
     }
-    EVP_MD *md = EVP_MD_fetch(NULL, "SHA2-256", NULL);
+    EVP_MD *md = EVP_MD_fetch(NULL, DIGEST_ALGORITHM, NULL);
     if (md == NULL)
     {
         EVP_MD_CTX_free(md_ctx);
@@ -794,20 +862,34 @@ bool peer_evp_init(peer_t *p)
         EVP_MD_CTX_free(md_ctx);
         return false;
     }
+    EVP_PKEY_CTX *pkey_ctx = EVP_PKEY_CTX_new_from_pkey(NULL, pkey, NULL);
+    if (pkey_ctx == NULL)
+    {
+        EVP_PKEY_free(pkey);
+        EVP_MD_free(md);
+        EVP_MD_CTX_free(md_ctx);
+        return false;
+    }
+    EVP_SIGNATURE *sig = EVP_SIGNATURE_fetch(NULL, SIGNATURE_ALGORITHM, NULL);
+    if (sig == NULL)
+    {
+        EVP_PKEY_free(pkey);
+        EVP_PKEY_CTX_free(pkey_ctx);
+        EVP_MD_free(md);
+        EVP_MD_CTX_free(md_ctx);
+        return false;
+    }
     p->evp_md_ctx = md_ctx;
     p->evp_md = md;
+    p->evp_pkey_ctx = pkey_ctx;
     p->evp_pkey = pkey;
+    p->evp_sig = sig;
     return true;
 }
 
-uint8_t *peer_evp_sign(peer_t *p, FILE *file)
+uint8_t *peer_evp_digest(peer_t *p, FILE *file)
 {
-    if (EVP_DigestSignInit(
-            p->evp_md_ctx,
-            NULL,
-            p->evp_md,
-            NULL,
-            p->evp_pkey) != 1)
+    if (EVP_DigestInit(p->evp_md_ctx, p->evp_md) != 1)
     {
         print_openssl_errors();
         return NULL;
@@ -825,20 +907,42 @@ uint8_t *peer_evp_sign(peer_t *p, FILE *file)
         {
             OPENSSL_free(buf);
             print_errno("fread");
-            return false;
+            return NULL;
         }
         if (!peer_tls_write(p, buf, n) ||
-            EVP_DigestSignUpdate(p->evp_md_ctx, buf, n) != 1)
+            EVP_DigestUpdate(p->evp_md_ctx, buf, n) != 1)
         {
             OPENSSL_free(buf);
             print_openssl_errors();
-            return false;
+            return NULL;
         }
         if (feof(file))
         {
             OPENSSL_free(buf);
             break;
         }
+    }
+    uint8_t *digest = OPENSSL_malloc(DIGEST_LENGTH);
+    if (digest == NULL)
+    {
+        print_errno("malloc");
+        return NULL;
+    }
+    if (EVP_DigestFinal(p->evp_md_ctx, digest, NULL) != 1)
+    {
+        OPENSSL_free(digest);
+        print_openssl_errors();
+        return NULL;
+    }
+    return digest;
+}
+
+uint8_t *peer_evp_sign(peer_t *p, uint8_t *digest)
+{
+    if (EVP_PKEY_sign_message_init(p->evp_pkey_ctx, p->evp_sig, NULL) != 1)
+    {
+        print_openssl_errors();
+        return NULL;
     }
     uint8_t *sig = OPENSSL_malloc(SIGNATURE_LENGTH);
     if (sig == NULL)
@@ -847,7 +951,12 @@ uint8_t *peer_evp_sign(peer_t *p, FILE *file)
         return NULL;
     }
     size_t sig_len = SIGNATURE_LENGTH;
-    if (EVP_DigestSignFinal(p->evp_md_ctx, sig, &sig_len) != 1)
+    if (EVP_PKEY_sign(
+            p->evp_pkey_ctx,
+            sig,
+            &sig_len,
+            digest,
+            DIGEST_LENGTH) != 1)
     {
         OPENSSL_free(sig);
         print_openssl_errors();
@@ -858,7 +967,9 @@ uint8_t *peer_evp_sign(peer_t *p, FILE *file)
 
 void peer_evp_free(peer_t *p)
 {
+    EVP_SIGNATURE_free(p->evp_sig);
     EVP_PKEY_free(p->evp_pkey);
+    EVP_PKEY_CTX_free(p->evp_pkey_ctx);
     EVP_MD_free(p->evp_md);
     EVP_MD_CTX_free(p->evp_md_ctx);
 }
@@ -972,18 +1083,25 @@ bool peer_rx_download_file(peer_t *p)
         fclose(file);
         return false;
     }
-    uint8_t *sig = peer_evp_sign(p, file);
-    if (sig == NULL)
+    uint8_t *digest = peer_evp_digest(p, file);
+    if (digest == NULL)
     {
         fclose(file);
         return false;
     }
     if (fclose(file) != 0)
     {
-        OPENSSL_free(sig);
+        OPENSSL_free(digest);
         print_errno("fclose");
         return false;
     }
+    uint8_t *sig = peer_evp_sign(p, digest);
+    if (sig == NULL)
+    {
+        OPENSSL_free(digest);
+        return false;
+    }
+    OPENSSL_free(digest);
     if (!peer_tls_write(p, sig, SIGNATURE_LENGTH))
     {
         OPENSSL_free(sig);
@@ -1055,7 +1173,6 @@ int peer_rx(peer_t *p)
     {
         return 0;
     }
-    prompt();
     return 1;
 }
 
@@ -1180,7 +1297,7 @@ int peer_tx(peer_t *p)
         print_errno("fgets");
         return -1;
     }
-    newline = true;
+    is_newline = true;
     buf[strcspn(buf, "\n")] = '\0';
     if (buf[0] == CMD_PREFIX_CHAR)
     {
@@ -1225,62 +1342,94 @@ int peer_tx(peer_t *p)
     {
         return -1;
     }
-    prompt();
     return 1;
 }
 
-bool peer_epoll_init(peer_t *p)
+bool peer_init(
+    peer_t *p,
+    char *addr,
+    char *cert,
+    char *cert_pkey,
+    char *ca_cert,
+    char *sig_pkey)
 {
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1)
+    p->addr = addr;
+    p->cert = cert;
+    p->cert_pkey = cert_pkey;
+    p->ca_cert = ca_cert;
+    p->sig_pkey = sig_pkey;
+    p->peer_fd = -1;
+    p->server_fd = -1;
+    p->epoll_fd = -1;
+    p->upload_next_id = 0;
+    p->upload_store = NULL;
+    p->download_store = NULL;
+    p->ssl_ctx = NULL;
+    p->ssl = NULL;
+    p->evp_md_ctx = NULL;
+    p->evp_pkey = NULL;
+    p->upload_store = file_store_new();
+    if (p->upload_store == NULL)
     {
-        print_errno("epoll_create1");
         return false;
     }
-    p->epoll_fd = epoll_fd;
-    struct epoll_event event;
-    event.events = EPOLLIN;
-    event.data.fd = STDIN_FILENO;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, STDIN_FILENO, &event) == -1)
+    p->download_store = file_store_new();
+    if (p->download_store == NULL)
     {
-        print_errno("epoll_ctl");
+        file_store_free(p->upload_store);
         return false;
     }
-    event.data.fd = p->peer_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, p->peer_fd, &event) == -1)
+    if (!peer_evp_init(p))
     {
-        print_errno("epoll_ctl");
+        file_store_free(p->download_store);
+        file_store_free(p->upload_store);
+        return false;
+    }
+    if (!peer_connect(p) && !peer_accept(p))
+    {
+        peer_evp_free(p);
+        file_store_free(p->download_store);
+        file_store_free(p->upload_store);
+        return false;
+    }
+    if (!peer_epoll_init(p))
+    {
+        peer_tls_close(p);
+        peer_tcp_close(p);
+        peer_evp_free(p);
+        file_store_free(p->download_store);
+        file_store_free(p->upload_store);
         return false;
     }
     return true;
 }
 
-bool peer_epoll_wait(peer_t *p)
+bool peer_run(peer_t *p)
 {
-    struct epoll_event events[2];
+    prompt();
+    int fds[EPOLL_MAX_EVENTS];
     while (true)
     {
-        int n = epoll_wait(p->epoll_fd, events, 2, -1);
+        int n = peer_epoll_wait(p, fds);
         if (n == -1)
         {
-            print_errno("epoll_wait");
             return false;
         }
         for (int i = 0; i < n; i++)
         {
-            int fd = events[i].data.fd;
             int ok;
-            if (fd == STDIN_FILENO)
+            if (fds[i] == STDIN_FILENO)
             {
                 ok = peer_tx(p);
             }
-            else if (fd == p->peer_fd)
+            else if (fds[i] == p->peer_fd)
             {
                 ok = peer_rx(p);
             }
             switch (ok)
             {
             case 1:
+                prompt();
                 continue;
             case 0:
                 return true;
@@ -1291,116 +1440,48 @@ bool peer_epoll_wait(peer_t *p)
     }
 }
 
-bool peer_close(peer_t *p)
+bool peer_free(peer_t *p)
 {
-    if (!peer_tls_close(p) || !peer_tcp_close(p))
-    {
-        return false;
-    }
+    bool tls_ok = peer_tls_close(p);
+    bool tcp_ok = peer_tcp_close(p);
     peer_evp_free(p);
     file_store_free(p->upload_store);
     file_store_free(p->download_store);
-    return true;
-}
-
-bool peer_run(peer_t *p)
-{
-    p->upload_store = file_store_new();
-    p->download_store = file_store_new();
-    if (!peer_evp_init(p))
-    {
-        return false;
-    }
-    if (!peer_connect(p) && !peer_accept(p))
-    {
-        return false;
-    }
-    prompt();
-    if (!peer_epoll_init(p) || !peer_epoll_wait(p))
-    {
-        peer_close(p);
-        return false;
-    }
-    return peer_close(p);
+    return tls_ok && tcp_ok;
 }
 
 bool run(int argc, char **argv)
 {
     if (argc != 6)
     {
-        fatalf(
-            "usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>",
+        eprintf(
+            "usage: %s <addr> <cert> <cert-pkey> <ca-cert> <sig-pkey>\n",
             argv[0]);
         return false;
     }
-    peer_t peer = {
-        .addr = argv[1],
-        .cert = argv[2],
-        .cert_pkey = argv[3],
-        .ca_cert = argv[4],
-        .sig_pkey = argv[5],
-        .peer_fd = -1,
-        .server_fd = -1,
-        .epoll_fd = -1,
-        .upload_next_id = 0,
-        .upload_store = NULL,
-        .download_store = NULL,
-        .ssl_ctx = NULL,
-        .ssl = NULL,
-        .evp_md_ctx = NULL,
-        .evp_md = NULL,
-        .evp_pkey = NULL,
-    };
-    return peer_run(&peer);
-}
-
-bool run_with_oqs_provider(int argc, char **argv)
-{
-    OSSL_PROVIDER *default_prov = OSSL_PROVIDER_load(NULL, "default");
-    if (default_prov == NULL)
+    char *addr = argv[1];
+    char *cert = argv[2];
+    char *cert_pkey = argv[3];
+    char *ca_cert = argv[4];
+    char *sig_pkey = argv[5];
+    peer_t peer;
+    if (!peer_init(&peer, addr, cert, cert_pkey, ca_cert, sig_pkey))
     {
-        print_openssl_errors();
         return false;
     }
-    OSSL_PROVIDER *oqs_prov = OSSL_PROVIDER_load(NULL, "oqsprovider");
-    if (oqs_prov == NULL)
+    if (!peer_run(&peer))
     {
-        print_openssl_errors();
+        peer_free(&peer);
         return false;
     }
-    if (!run(argc, argv))
-    {
-        OSSL_PROVIDER_unload(default_prov);
-        OSSL_PROVIDER_unload(oqs_prov);
-        return false;
-    }
-    if (OSSL_PROVIDER_unload(default_prov) == 0)
-    {
-        print_openssl_errors();
-        return false;
-    }
-    if (OSSL_PROVIDER_unload(oqs_prov) == 0)
-    {
-        print_openssl_errors();
-        return false;
-    }
-    return true;
-}
-
-bool run_with_oqs(int argc, char **argv)
-{
-    debugf("using oqs version %s", OQS_version());
-    OQS_init();
-    bool ok = run_with_oqs_provider(argc, argv);
-    OQS_destroy();
-    return ok;
+    return peer_free(&peer);
 }
 
 int main(int argc, char **argv)
 {
     char *debug_env = getenv("DEBUG");
-    debug = debug_env != NULL && strcmp(debug_env, "true") == 0;
-    int code = run_with_oqs(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE;
+    is_debug = debug_env != NULL && strcmp(debug_env, "true") == 0;
+    int code = run(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE;
     debugf("exit status %d", code);
     return code;
 }

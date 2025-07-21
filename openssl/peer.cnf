@@ -6,12 +6,8 @@ providers = provider_sect
 
 [provider_sect]
 default = default_sect
-oqsprovider = oqsprovider_sect
 
 [default_sect]
-activate = 1
-
-[oqsprovider_sect]
 activate = 1
 
 [req]

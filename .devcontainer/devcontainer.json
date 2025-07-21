@@ -7,7 +7,6 @@
       "settings": {
         "C_Cpp.default.includePath": [
           "${containerEnv:OPENSSL_DIR}/include",
-          "${containerEnv:LIBOQS_DIR}/include",
           "/usr/include"
         ]
       }
